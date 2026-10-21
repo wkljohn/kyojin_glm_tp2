@@ -3,6 +3,10 @@
 <p align="center">
 Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https://github.com/turboderp-org/exllamav3">ExLlamaV3</a>, with speculative decoding, for 100 GB-class models in 128 GB.</p>
 
+This fork's experimental [two-host GLM channel-TP path](doc/glm_channel_tp2.md)
+preserves the selected Mia EXL3 weights, shards routed expert channels across
+two gfx1151 hosts, and uses RCCL over RoCE v2 with replicated attention.
+
 <p align="center">
 <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-444444"></a>
 <img alt="gfx1151" src="https://img.shields.io/badge/AMD-gfx1151%20%7C%20ROCm%207-444444">

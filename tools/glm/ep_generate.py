@@ -10,6 +10,19 @@ the script compares every rank's token ids with rank 0's and exits non-zero on a
 import argparse, os, sys, time, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# The GLM server's measured kernel-route defaults (tools/glm/serve.py SPEED_ENV), applied before the engine loads so the
+# EP runs use the same fast paths; every rank applies the same table. KYOJIN_NO_SPEED_ENV=1 skips it
+if os.environ.get("KYOJIN_NO_SPEED_ENV", "0") != "1":
+    import ast as _ast
+    _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.py"), encoding = "utf8").read()
+    _tree = _ast.parse(_src)
+    for _node in _tree.body:
+        if isinstance(_node, _ast.Assign) and any(getattr(t, "id", None) == "SPEED_ENV" for t in _node.targets):
+            for _k, _v in _ast.literal_eval(_node.value).items():
+                if _k != "EXL3_GLM_DYN":   # MTP drafter policy of the server, not used here
+                    os.environ.setdefault(_k, _v)
+    os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
+
 import torch
 
 PROMPTS = [

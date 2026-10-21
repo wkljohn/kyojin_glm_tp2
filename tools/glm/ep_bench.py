@@ -24,6 +24,19 @@ import argparse, csv, hashlib, json, os, random, sys, time
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# The GLM server's measured kernel-route defaults (tools/glm/serve.py SPEED_ENV), applied before the engine loads so the
+# EP runs use the same fast paths; every rank applies the same table. KYOJIN_NO_SPEED_ENV=1 skips it
+if os.environ.get("KYOJIN_NO_SPEED_ENV", "0") != "1":
+    import ast as _ast
+    _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.py"), encoding = "utf8").read()
+    _tree = _ast.parse(_src)
+    for _node in _tree.body:
+        if isinstance(_node, _ast.Assign) and any(getattr(t, "id", None) == "SPEED_ENV" for t in _node.targets):
+            for _k, _v in _ast.literal_eval(_node.value).items():
+                if _k != "EXL3_GLM_DYN":   # MTP drafter policy of the server, not used here
+                    os.environ.setdefault(_k, _v)
+    os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
+
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -118,7 +131,13 @@ def body_needle():
     return " ".join(sents), "What vault access code did the archivist choose, and who is the archivist? Answer in one sentence."
 
 
-BODIES = dict(dossier = body_dossier, code = body_code, prose = body_prose, chat = body_chat, math = body_math,
+def body_warm():
+    r = _rng("warm")
+    return " ".join(f"item {i}: value {r.randint(0, 99999)} tag {r.choice('abcdefgh')}" for i in range(2000)), \
+        "Count the items tagged h."
+
+
+BODIES = dict(warm = body_warm, dossier = body_dossier, code = body_code, prose = body_prose, chat = body_chat, math = body_math,
               json = body_json, zh = body_zh, needle = body_needle)
 
 
@@ -175,7 +194,7 @@ def main():
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     tokenizer = Tokenizer.from_config(config)
-    ctx = args.prompt_tokens + args.gen_tokens + 1024
+    ctx = (args.prompt_tokens + args.gen_tokens + 1024 + 255) // 256 * 256   # caches need page multiples
     hist = max(1, args.num_draft)
     cache = Cache(model, max_num_tokens = ctx + 4096, max_history = hist, max_batch_size = 1)
     model.load(device = "cuda:0", progressbar = False)
@@ -214,7 +233,7 @@ def main():
 
     # Warm-up: kernel JIT, allocator growth, first-use tuning (not reported)
     # full prompt length: the first measured case must not pay for new prefill shapes
-    warm = build_ids(tokenizer, "math", args.prompt_tokens)
+    warm = build_ids(tokenizer, "warm", args.prompt_tokens)   # not a measured prompt: no prefix-cache reuse
     run_case(warm)
 
     fams = [f.strip() for f in args.families.split(",") if f.strip()]

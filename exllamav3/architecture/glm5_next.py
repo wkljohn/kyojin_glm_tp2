@@ -162,10 +162,18 @@ class Glm5NextModel(Model):
 
         self.first_block_idx = len(self.modules)
 
+        from ..model.ep import ep_state
+        ep = ep_state()
+
         for idx in range(config.num_hidden_layers):
             key = f"{key_prefix}.layers.{idx}"
 
             if config.layer_types[idx] == "linear_attention":
+                kda_heads, kda_range = config.linear_num_heads, None
+                if ep is not None and os.environ.get("KYOJIN_EP_KDA_SPLIT", "1") != "0":
+                    assert config.linear_num_heads % ep.world == 0
+                    kda_heads = config.linear_num_heads // ep.world
+                    kda_range = (ep.rank * kda_heads, config.linear_num_heads)
                 attn = GatedDeltaNet(
                     config = config,
                     key = f"{key}.self_attn",
@@ -173,8 +181,9 @@ class Glm5NextModel(Model):
                     hidden_size = config.hidden_size,
                     k_head_dim = config.linear_head_dim,
                     v_head_dim = config.linear_head_dim,
-                    num_k_heads = config.linear_num_heads,
-                    num_v_heads = config.linear_num_heads,
+                    num_k_heads = kda_heads,
+                    num_v_heads = kda_heads,
+                    head_range = kda_range,
                     rms_norm_eps = config.rms_norm_eps,
                     conv_kernel_size = config.linear_conv_kernel_size,
                     key_qkv = "qkv_proj",
@@ -222,6 +231,10 @@ class Glm5NextModel(Model):
                     index_kpool = config.index_kpool,
                     index_kpool_tail = config.index_kpool_tail,
                 )
+
+            if getattr(attn, "head_range", None):
+                attn.ep = ep
+                attn.tp_reduce = True
 
             def _hc(tag: str):
                 return HyperConnection(

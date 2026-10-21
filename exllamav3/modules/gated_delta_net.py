@@ -455,9 +455,15 @@ class GatedDeltaNet(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         select_hq_bits: int = 0,
+        head_range: tuple[int, int] | None = None,
     ):
         super().__init__(config, key, None)
         self.module_name = "GatedDeltaNet"
+        # Cross-host head shard (model/ep.py): (first_head, total_heads); num_k/v_heads are this rank's count.
+        # Projections are cut to the rank's heads, o_proj to the matching input rows, and the o_proj partials are
+        # summed by the EP all-reduce at the end of forward()
+        self.head_range = head_range
+        self.ep = None
 
         self.q_priority = 1 + select_hq_bits
         self.layer_idx = layer_idx
@@ -532,9 +538,13 @@ class GatedDeltaNet(Module):
                 qmap = qmap + ".input",
                 out_dtype = torch.float,
                 alt_key = None if not key_qkv_alt else [f"{key}.{x}" for x in key_qkv_alt],
+                alt_out_slice = (head_range[0] * k_head_dim, num_k_heads * k_head_dim) if head_range else None,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkvz",
             )
+            if head_range:
+                assert key_qkv_alt and not config.stc.has_tensor(f"{key}.{key_qkv}.weight"), \
+                    "head-range shard needs separately stored q/k/v projections"
             self.qkvz_proj = None
             self.register_submodule(self.qkv_proj)
             if key_z:
@@ -568,7 +578,8 @@ class GatedDeltaNet(Module):
             self.register_submodule(self.b_proj)
             self.register_submodule(self.a_proj)
         elif key_b and self.kda:
-            self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1,
+                                 **(dict(full_out_features = head_range[1], first_out_feature = head_range[0]) if head_range else {}))
             self.a_proj = None
             self.ba_proj = None
             self.register_submodule(self.b_proj)
@@ -588,9 +599,11 @@ class GatedDeltaNet(Module):
         # sensitivity signal
         if self.kda:
             self.f_a_proj = Linear(config, f"{key}.{key_f_a}", hidden_size, self.k_head_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
-            self.f_b_proj = Linear(config, f"{key}.{key_f_b}", self.k_head_dim, self.k_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.f_b_proj = Linear(config, f"{key}.{key_f_b}", self.k_head_dim, self.k_dim, qmap = None, out_dtype = torch.float, pad_to = 1,
+                                   **(dict(full_out_features = head_range[1] * k_head_dim, first_out_feature = head_range[0] * k_head_dim) if head_range else {}))
             self.g_a_proj = Linear(config, f"{key}.{key_g_a}", hidden_size, self.v_head_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
-            self.g_b_proj = Linear(config, f"{key}.{key_g_b}", self.v_head_dim, self.v_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.g_b_proj = Linear(config, f"{key}.{key_g_b}", self.v_head_dim, self.v_dim, qmap = None, out_dtype = torch.float, pad_to = 1,
+                                   **(dict(full_out_features = head_range[1] * v_head_dim, first_out_feature = head_range[0] * v_head_dim) if head_range else {}))
             for m in (self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj):
                 self.register_submodule(m)
         else:
@@ -605,6 +618,8 @@ class GatedDeltaNet(Module):
                 f"{key}.{key_o}",
                 self.v_head_dim * self.num_v_heads,
                 hidden_size,
+                **(dict(full_in_features = head_range[1] * v_head_dim, first_in_feature = head_range[0] * v_head_dim)
+                   if head_range else {}),
                 qmap = qmap + ".output",
                 out_dtype = self.out_dtype,
                 select_hq_bits = select_hq_bits,
@@ -882,6 +897,10 @@ class GatedDeltaNet(Module):
             # Kimi Linear stores A_log as (1, 1, H, 1); the kernels take it as (H,)
             self.a_log = self.a_log.reshape(-1)
             self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
+            if self.head_range:
+                h0, kd = self.head_range[0], self.k_head_dim
+                self.a_log = self.a_log[h0 : h0 + self.num_v_heads].contiguous()
+                self.dt_bias = self.dt_bias[h0 * kd : (h0 + self.num_k_heads) * kd].contiguous()
         if self.key_conv1d_weight is not None:
             # no_defer: load_local concatenates/flattens (copies) these immediately, which a
             # deferred (unfilled) tensor would corrupt
@@ -891,6 +910,13 @@ class GatedDeltaNet(Module):
                 self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
                 self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
                 self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
+                if self.head_range:
+                    c0, cn = self.head_range[0] * self.k_head_dim, self.num_k_heads * self.k_head_dim
+                    self.conv1d_q_weight = self.conv1d_q_weight[c0 : c0 + cn].contiguous()
+                    self.conv1d_k_weight = self.conv1d_k_weight[c0 : c0 + cn].contiguous()
+                    self.conv1d_v_weight = self.conv1d_v_weight[c0 : c0 + cn].contiguous()
+            elif self.head_range:
+                raise NotImplementedError("head-range shard of a fused conv1d weight")
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
@@ -1459,7 +1485,7 @@ class GatedDeltaNet(Module):
         if self.num_k_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                (self.ep or params["backend"]).all_reduce(x, False)
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
@@ -1537,7 +1563,7 @@ class GatedDeltaNet(Module):
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_base, recurrent_slots, save_history)
             if self.tp_reduce:
-                params["backend"].all_reduce(y)
+                (self.ep or params["backend"]).all_reduce(y)
             return to2(y, out_dtype, self.out_dtype)
 
         # Torch path
@@ -1785,7 +1811,7 @@ class GatedDeltaNet(Module):
 
         # TP reduction
         if self.tp_reduce:
-            params["backend"].all_reduce(x)
+            (self.ep or params["backend"]).all_reduce(x)
 
         # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
         if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \

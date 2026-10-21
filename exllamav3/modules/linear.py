@@ -51,6 +51,7 @@ class Linear(Module):
         out_features: int,
         qmap: str | None = None,
         alt_key: str | list | None = None,
+        alt_out_slice: tuple[int, int] | None = None,
         qbits_key: str = "bits",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
@@ -81,6 +82,9 @@ class Linear(Module):
         super().__init__(config, key, qmap)
 
         self.alt_key = alt_key
+        # (first, count) output columns kept from EACH component of a list alt_key (head-range shards of
+        # separately stored q/k/v projections), applied before concatenation
+        self.alt_out_slice = alt_out_slice
         self.in_features_unpadded = in_features
         self.in_features = (in_features + pad_to - 1) // pad_to * pad_to
         self.out_features_unpadded = out_features
@@ -208,6 +212,11 @@ class Linear(Module):
                 dev = self.device
                 weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
                 bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
+                if self.alt_out_slice is not None:
+                    assert self.transposed_load, "alt_out_slice needs (in, out) weights"
+                    f0, fn = self.alt_out_slice
+                    weight = [w[..., f0 : f0 + fn].contiguous() for w in weight]
+                    bias = [b[..., f0 : f0 + fn].contiguous() if b is not None else None for b in bias]
                 weight = torch.cat(weight, dim = -1)
                 bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
             else:

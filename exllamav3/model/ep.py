@@ -57,6 +57,13 @@ class EPState:
             tensor.copy_(t)
         self.reduces += 1
 
+    def all_gather_last(self, t: torch.Tensor) -> torch.Tensor:
+        """Concatenate every rank's t along the last dim in rank order (vocab-split head logits)."""
+        t = t.contiguous()
+        out = torch.empty((self.world,) + tuple(t.shape), dtype = t.dtype, device = t.device)
+        dist.all_gather_into_tensor(out.view(-1), t.view(-1))
+        return out.movedim(0, -2).reshape(*t.shape[:-1], self.world * t.shape[-1])
+
     def broadcast_obj(self, obj = None, src: int = 0):
         box = [obj]
         dist.broadcast_object_list(box, src = src)

@@ -135,6 +135,20 @@ class Glm5NextConfig(Config):
         self.vision_end_token_id = self.read_cfg(int, "image_end_token_id", no_default)
 
 
+class EPVocabHead(Linear):
+    """lm_head split by vocabulary across EP ranks: each rank reads and computes its contiguous vocab share and the
+    logits are all-gathered in rank order, so every rank returns the full row (sampling stays replicated)."""
+
+    def __init__(self, ep, config, key, in_features, vocab_size, **kwargs):
+        n = vocab_size // ep.world
+        super().__init__(config = config, key = key, in_features = in_features, out_features = n,
+                         full_out_features = vocab_size, first_out_feature = ep.rank * n, **kwargs)
+        self.ep = ep
+
+    def forward(self, x, params, out_dtype = None):
+        return self.ep.all_gather_last(super().forward(x, params, out_dtype))
+
+
 class Glm5NextModel(Model):
     config_class = Glm5NextConfig
 
@@ -342,6 +356,10 @@ class Glm5NextModel(Model):
 
         self.last_kv_module_idx = len(self.modules) - 1
 
+        use_vocab_split = (
+            ep is not None and os.environ.get("KYOJIN_EP_HEAD_SPLIT", "1") != "0" and
+            config.vocab_size % (128 * ep.world) == 0 and not config.tie_word_embeddings
+        )
         head_alt_key = None
         if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):
             head_alt_key = f"{key_prefix}.embed_tokens"
@@ -370,6 +388,9 @@ class Glm5NextModel(Model):
                 out_features = config.vocab_size,
                 qmap = "block",
                 caps = {"logits_output": True}
+            ) if not use_vocab_split else EPVocabHead(
+                ep, config, "lm_head", config.hidden_size, config.vocab_size,
+                qbits_key = "head_bits", qmap = "block", caps = {"logits_output": True},
             )
         ]
 

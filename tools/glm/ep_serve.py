@@ -13,8 +13,12 @@ operation over a dedicated gloo group (TCP, no NCCL watchdog while idle):
     ("check", digest)                                end-of-job token agreement; rank 1 answers with its own digest
 
 One request runs at a time (--sessions 1). Speculation decisions depend on generator state only, which both ranks
-build from the same command stream, so the collective schedules match. A digest mismatch marks the pair faulted and
-every later request fails with 503 until restart.
+build from the same command stream, so the collective schedules match. The one input computed separately per rank, the
+drafter's output, is taken from rank 0 (Generator._ep_share_draft), and every decode/verify forward first checks that
+both ranks run the same rows (Generator._ep_check_rows): a mismatch makes both ranks exit (EPDesync, exit code 70) so
+the service manager restarts the pair, instead of a collective hang. After every job, finished or cancelled, the ranks
+compare a digest of the generated tokens; a mismatch marks the pair faulted and every later request fails with 503
+until restart.
 
     tools/glm/ep_launch.sh tools/glm/ep_serve.py --model <pack> --draft <DFlash2 dir> --host <ip> --port <port>
 """
@@ -153,6 +157,15 @@ class EPEngine(serve.ResidentEngine):
         torch.cuda.empty_cache()
         self.greedy_generator = self._make_generator()
 
+    def iterate(self, g) -> list:
+        """One generator step; on EPDesync (both ranks raise it together) exit so the pair is restarted."""
+        from exllamav3.model.ep import EPDesync
+        try:
+            return list(g.iterate())
+        except EPDesync as e:
+            print(f"ep_serve: FAULT {e}; exiting (70) so the pair restarts", file = sys.stderr, flush = True)
+            os._exit(70)
+
     def run(self, fn, *args):
         """Queue fn on the generator thread; awaitable from any event loop."""
         self._last = self.pool.submit(fn, *args)
@@ -195,17 +208,23 @@ class EPEngine(serve.ResidentEngine):
             self.send(("job", ids, max_tokens, spec, stops, seed))
             g.enqueue(holder[0])
 
+        toks = []
+
         def step():
             self.send(("step", False))
-            return list(g.iterate())
+            batch = self.iterate(g)
+            # Counted here, on the generator thread, so the digest also covers steps whose events the request never
+            # read (client gone mid-step)
+            for event in batch:
+                if event.get("token_ids") is not None:
+                    toks.extend(event["token_ids"].flatten().tolist())
+            return batch
 
         def stop_job():
             self.send(("step", True))
             g.cancel(holder[0])
 
         await self.run(start)
-        toks = []
-        finished = False
         try:
             while g.num_remaining_jobs():
                 if cancel is not None and cancel.is_set():
@@ -215,8 +234,6 @@ class EPEngine(serve.ResidentEngine):
                 for event in batch:
                     if event.get("error"):
                         raise RuntimeError(str(event["error"]))
-                    if event.get("token_ids") is not None:
-                        toks += event["token_ids"].flatten().tolist()
                     text = event.get("text", "")
                     if text:
                         yield text
@@ -224,7 +241,6 @@ class EPEngine(serve.ResidentEngine):
                         self.last_stats = event
                         if stats is not None:
                             stats.update(event)
-                        finished = True
             torch.cuda.synchronize()
         finally:
             def end():
@@ -232,13 +248,12 @@ class EPEngine(serve.ResidentEngine):
                 if g.num_remaining_jobs():
                     g.clear_queue()
                 g.flush_deferred()
-                if finished:
-                    digest = hashlib.sha256(json.dumps(toks).encode()).hexdigest()[:16]
-                    self.send(("check", digest))
-                    peer = self.answer(None)
-                    if peer != digest:
-                        self.faulted = f"token digest mismatch rank0 {digest} rank1 {peer}"
-                        print(f"ep_serve: FAULT {self.faulted}", file = sys.stderr, flush = True)
+                digest = hashlib.sha256(json.dumps(toks).encode()).hexdigest()[:16]
+                self.send(("check", digest))
+                peer = self.answer(None)
+                if peer != digest:
+                    self.faulted = f"token digest mismatch rank0 {digest} rank1 {peer}"
+                    print(f"ep_serve: FAULT {self.faulted}", file = sys.stderr, flush = True)
             # the reply goes out now; the bookkeeping runs on the generator thread before anything queued later
             self._last = self.pool.submit(end)
 
@@ -259,7 +274,7 @@ class EPEngine(serve.ResidentEngine):
                 if cmd[1]:
                     g.cancel(job)
                 elif g.num_remaining_jobs():
-                    for event in g.iterate():
+                    for event in self.iterate(g):
                         if event.get("token_ids") is not None:
                             toks += event["token_ids"].flatten().tolist()
                 else:

@@ -12,10 +12,15 @@ RCCL network selection is left to the usual NCCL_* variables (NCCL_NET=IB, NCCL_
 """
 from __future__ import annotations
 import os
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 
 _STATE = None
+
+
+class EPDesync(RuntimeError):
+    """The ranks are about to run different work (the collective schedules would no longer match)."""
 
 
 class EPState:
@@ -99,12 +104,16 @@ def ep_state() -> EPState | None:
         addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
         port = _env_int("MASTER_PORT", default = 29531)
         device = torch.device("cuda", torch.cuda.current_device())
+        # A collective that one rank never joins aborts the process after this long (torch's NCCL watchdog,
+        # TORCH_NCCL_ASYNC_ERROR_HANDLING=3) instead of hanging the pair forever
+        timeout = timedelta(seconds = _env_int("KYOJIN_EP_NCCL_TIMEOUT", default = 300))
         dist.init_process_group(
             "nccl",
             init_method = f"tcp://{addr}:{port}",
             rank = rank,
             world_size = world,
             device_id = device,
+            timeout = timeout,
         )
         # First collective sets up the RCCL communicator; fail loudly here, not inside a layer
         t = torch.full((4096,), float(rank + 1), device = device)

@@ -247,6 +247,10 @@ class Generator:
         # measured speculative rate would not beat plain decode. Opt-in: EXL3_SPEC_GATE=1
         self.spec_gate = SpecGate() if (draft_model is not None and
                                         os.environ.get("EXL3_SPEC_GATE", "0") != "0") else None
+        # Cross-host expert parallel (model/ep.py): every rank runs this generator in lockstep, so per-step shapes
+        # must match exactly. See _ep_share_draft and _ep_check_rows
+        from ..model.ep import ep_state
+        self._ep = ep_state()
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -1185,6 +1189,8 @@ class Generator:
         _t1 = _pt()
         new_ids = self.draft_model.sample_from_state(out_state, params)
         _t2 = _pt()
+        if self._ep is not None:
+            new_ids = self._ep_share_draft(new_ids, params)
         if SPEC_PROF:
             _PROF_CUR["t_dfwd"] = _t1 - _t0
             _PROF_CUR["t_dsamp"] = _t2 - _t1
@@ -1221,6 +1227,73 @@ class Generator:
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
         return self.draft_ids_pinned[:, :window]
+
+
+    def _ep_share_draft(self, new_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        """
+        Cross-host EP: replace this rank's draft with rank 0's. The draft ids and confidences decide the verify width
+        and feed the confidence calibrator, and each rank computes them with its own replicated drafter, so a one-ulp
+        difference between ranks would give the ranks different verify widths (mismatched collectives, a hang) and
+        drifting calibrators. Ids, confidences and the confidence length go in one float64 broadcast (exact for all
+        three).
+        """
+        import torch.distributed as dist
+        conf = params.get("draft_conf")
+        conf_len = params.get("draft_confidence_len")
+        parts = [new_ids.reshape(-1).to(torch.float64)]
+        if conf is not None:
+            parts.append(conf.reshape(-1).to(new_ids.device, torch.float64))
+        parts.append(torch.tensor([-1.0 if conf_len is None else float(conf_len)], dtype = torch.float64,
+                                  device = new_ids.device))
+        buf = torch.cat(parts)
+        mine = buf.clone() if EP_DRAFT_DEBUG and self._ep.rank != 0 else None
+        dist.broadcast(buf, src = 0)
+        if mine is not None:
+            # KYOJIN_EP_DRAFT_DEBUG=1: count rounds where this rank's own draft differed from rank 0's
+            self._ep_draft_rounds = getattr(self, "_ep_draft_rounds", 0) + 1
+            if not torch.equal(mine, buf):
+                self._ep_draft_diffs = getattr(self, "_ep_draft_diffs", 0) + 1
+                k = new_ids.numel()
+                print(f" -- EP draft differs from rank 0 ({self._ep_draft_diffs}/{self._ep_draft_rounds} rounds): "
+                      f"ids {int((mine[:k] != buf[:k]).sum())}, max |dconf| {float((mine[k:] - buf[k:]).abs().max()):.3g}",
+                      flush = True)
+        n = new_ids.numel()
+        new_ids = buf[:n].view(new_ids.shape).to(new_ids.dtype)
+        if conf is not None:
+            params["draft_conf"] = buf[n:n + conf.numel()].view(conf.shape).to(conf.device, conf.dtype)
+        if conf_len is not None:
+            params["draft_confidence_len"] = int(buf[-1].item())
+        return new_ids
+
+
+    def _ep_check_rows(self, batch_size: int, draft_tokens: torch.Tensor | None):
+        """
+        Cross-host EP: before a decode/verify forward, check that every rank is about to run the same batch, draft
+        width and draft tokens (min == max over ranks, one all-reduce). A mismatch would otherwise be a silent
+        collective hang; here every rank sees the same reduced values and raises EPDesync together.
+        """
+        import torch.distributed as dist
+        from ..model.ep import EPDesync
+        dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        if draft_tokens is None:
+            w, s = 0, torch.zeros((), dtype = torch.int64, device = dev)
+        else:
+            d = draft_tokens.to(dev, torch.int64)
+            w = int(d.shape[-1])
+            pos = torch.arange(1, d.numel() + 1, dtype = torch.int64, device = dev).view(d.shape)
+            s = (d * pos).sum()
+        if EP_FAULT_TEST and self._ep.rank == 1 and draft_tokens is not None:
+            # KYOJIN_EP_FAULT_TEST=N: rank 1 reports a wrong width on its Nth verify (tests the fail-closed path)
+            self._ep_fault_n = getattr(self, "_ep_fault_n", 0) + 1
+            if self._ep_fault_n == EP_FAULT_TEST:
+                w += 1
+        t = torch.stack((torch.tensor(batch_size, device = dev), torch.tensor(w, device = dev), s)).to(torch.int64)
+        t = torch.cat((t, -t))
+        dist.all_reduce(t, op = dist.ReduceOp.MAX)
+        mx, mn = t[:3].tolist(), [-v for v in t[3:].tolist()]
+        if mx != mn:
+            raise EPDesync(f"rank {self._ep.rank}: batch/draft width/draft checksum differ across ranks: "
+                           f"local ({batch_size}, {w}), max {mx}, min {mn}")
 
 
     def iterate_ngram_gen(self, results: list):
@@ -1278,6 +1351,8 @@ class Generator:
             if not job.is_prefill_done(): continue
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens)
             batch_size += len(job.sequences)
+        if self._ep is not None:
+            self._ep_check_rows(batch_size, draft_tokens)
         if batch_size == 0:
             return
         if draft_tokens is not None:
@@ -2077,6 +2152,8 @@ class Generator:
 
 
 SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
+EP_DRAFT_DEBUG = os.environ.get("KYOJIN_EP_DRAFT_DEBUG", "0") != "0"
+EP_FAULT_TEST = int(os.environ.get("KYOJIN_EP_FAULT_TEST", "0"))
 SPEC_PROF_REC: list = []
 _PROF_CUR: dict = {}
 

@@ -80,8 +80,16 @@ Always start and stop the pair together. Rank 0 serves HTTP; rank 1 has no liste
 - **One request at a time**; others queue. The prompt cache (prefix reuse) is what makes agent follow-up turns fast.
 - **No auth**: the server binds `HOST:PORT` unauthenticated. Put a reverse proxy with auth in front (reference: Caddy
   `reverse_proxy` to the backend with a `Bearer` header check, `flush_interval -1`, `response_header_timeout 900s`).
-- **Fail-closed**: after every request both ranks compare a digest of the generated tokens. A mismatch logs
-  `ep_serve: FAULT ...` and every later request gets HTTP 503 until restart. Report it if it ever happens.
+- **Fail-closed**: the two ranks must run the same work in the same order.
+  - Before every decode/verify step they check that their rows agree. A mismatch logs `ep_serve: FAULT ...
+    exiting (70)` on both and both processes exit; `Restart=on-failure` brings the pair back (~90 s).
+  - A collective one rank never joins aborts the process after `KYOJIN_EP_NCCL_TIMEOUT` seconds (default 300)
+    instead of hanging forever.
+  - After every request, finished or cancelled, both ranks compare a digest of the generated tokens. A mismatch
+    marks the pair faulted and every later request gets HTTP 503 until restart.
+  - Report any `FAULT` line.
+- **Diagnostics** (env in `/etc/kyojin-ep.env`, off by default): `KYOJIN_EP_DRAFT_DEBUG=1` makes rank 1 log every
+  round where its own drafter output differed from rank 0's (rank 0's is always used).
 - **No image input** (HTTP 400). Vision is not loaded in the EP server.
 - **Sampling** is supported (each request gets one seed shared by both ranks). Default sampling comes from the pack's
   `generation_config.json` (temperature 1.0, top_p 0.95) when a request omits it.
@@ -89,6 +97,20 @@ Always start and stop the pair together. Rank 0 serves HTTP; rank 1 has no liste
 - **Logs**: `journalctl -u kyojin-ep`; per-request numbers in `KYOJIN_REQLOG_DIR`; counters at `GET /metrics`
   (Prometheus text, llama.cpp names).
 - **Licenses**: the DFlash2 drafter is CC BY-NC-ND 4.0 (non-commercial). Check the model pack's own LICENSE.
+
+## Updating
+
+A new package differs from the old one in `source/` (and maybe `deploy/`); the runtime only changes if its checksum
+does. Copy the new package over the old one with `rsync -a` (only the changed files move), then from rank 0:
+
+```bash
+PEER=user@<rank-1 host> ./deploy/update.sh . /opt/kyojin-glm-tp2   # stops both, syncs the package to the peer
+                                                                   # (without runtime/), updates both, starts both
+./deploy/smoke_test.sh http://127.0.0.1:8083
+```
+
+The previous tree stays at `/opt/kyojin-glm-tp2/kyojin_glm_tp2.prev`. To roll back, stop both ranks, swap the two
+directories on both hosts, and start them again.
 
 ## opencode
 

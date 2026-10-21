@@ -834,11 +834,11 @@ namespace wide
 
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * 32;
-constexpr int VEC = 8;                       // columns per lane (one 16-byte load)
-constexpr int COLS = 32 * VEC;               // columns per block
+constexpr int VEC = 8;                       // columns per lane (one 16-byte load); 4 (8-byte loads) for M >= 5
+constexpr int COLS = 32 * VEC;               // columns per block at VEC = 8
 constexpr int MAX_M = 8;
 constexpr int MAX_KC = 1024;                 // k rows per block (LDS: MAX_M * MAX_KC halves = 16 KiB)
-constexpr int TARGET_BLOCKS = 320;           // ~8 blocks per CU on 40 CUs
+constexpr int TARGET_BLOCKS = 160;           // ~4 blocks per CU on 40 CUs (sweep: 160 > 320 > 640 for M = 1 and 8)
 constexpr size_t WS_BYTES = 48u << 20;       // partials workspace per device
 static float* g_ws[MAX_DEVICES] = {};
 
@@ -853,7 +853,7 @@ static bool enabled()
     return cached == 1;
 }
 
-template <int M>
+template <int M, int V>
 __global__ __launch_bounds__(THREADS)
 void wide_partials_kernel
 (
@@ -878,37 +878,41 @@ void wide_partials_kernel
     }
     __syncthreads();
 
-    const int col = blockIdx.x * COLS + lane * VEC;
+    constexpr int BC = 32 * V;                // columns per block
+    using LT = std::conditional_t<V == 8, uint4, uint2>;
+    const int col = blockIdx.x * BC + lane * V;
     const bool active = col < n;
-    float acc[M][VEC];
+    float acc[M][V];
     #pragma unroll
     for (int i = 0; i < M; ++i)
         #pragma unroll
-        for (int v = 0; v < VEC; ++v) acc[i][v] = 0.0f;
+        for (int v = 0; v < V; ++v) acc[i][v] = 0.0f;
 
     if (active)
     {
         const half* bp = b + col;
         int kk = k0 + warp;
         // four rows in flight per lane
-        for (; kk + 3 * WARPS < k1; kk += 4 * WARPS)
+        constexpr int Q = V / 2;              // half2 per load
+        constexpr int U = V == 8 ? 4 : 8;     // rows in flight per lane
+        for (; kk + (U - 1) * WARPS < k1; kk += U * WARPS)
         {
-            uint4 r[4];
+            LT r[U];
             #pragma unroll
-            for (int u = 0; u < 4; ++u) r[u] = *((const uint4*) (bp + (size_t) (kk + u * WARPS) * n));
+            for (int u = 0; u < U; ++u) r[u] = *((const LT*) (bp + (size_t) (kk + u * WARPS) * n));
             #pragma unroll
-            for (int u = 0; u < 4; ++u)
+            for (int u = 0; u < U; ++u)
             {
                 const half2* h = (const half2*) &r[u];
-                float2 f[4];
+                float2 f[Q];
                 #pragma unroll
-                for (int q = 0; q < 4; ++q) f[q] = __half22float2(h[q]);
+                for (int q = 0; q < Q; ++q) f[q] = __half22float2(h[q]);
                 #pragma unroll
                 for (int i = 0; i < M; ++i)
                 {
                     const float av = __half2float(sa[i][kk + u * WARPS - k0]);
                     #pragma unroll
-                    for (int q = 0; q < 4; ++q)
+                    for (int q = 0; q < Q; ++q)
                     {
                         acc[i][2 * q] = fmaf(av, f[q].x, acc[i][2 * q]);
                         acc[i][2 * q + 1] = fmaf(av, f[q].y, acc[i][2 * q + 1]);
@@ -918,14 +922,14 @@ void wide_partials_kernel
         }
         for (; kk < k1; kk += WARPS)
         {
-            const uint4 r = *((const uint4*) (bp + (size_t) kk * n));
+            const LT r = *((const LT*) (bp + (size_t) kk * n));
             const half2* h = (const half2*) &r;
             #pragma unroll
             for (int i = 0; i < M; ++i)
             {
                 const float av = __half2float(sa[i][kk - k0]);
                 #pragma unroll
-                for (int q = 0; q < 4; ++q)
+                for (int q = 0; q < Q; ++q)
                 {
                     const float2 f = __half22float2(h[q]);
                     acc[i][2 * q] = fmaf(av, f.x, acc[i][2 * q]);
@@ -936,22 +940,24 @@ void wide_partials_kernel
     }
 
     // reduce the 8 warps' row slices through LDS, one row of M at a time (fixed order)
-    __shared__ float red[WARPS][COLS];
+    __shared__ float red[WARPS][BC];
     float* out = part + (size_t) blockIdx.y * M * n;
     #pragma unroll
     for (int i = 0; i < M; ++i)
     {
         #pragma unroll
-        for (int v = 0; v < VEC; ++v) red[warp][lane * VEC + v] = acc[i][v];
+        for (int v = 0; v < V; ++v) red[warp][lane * V + v] = acc[i][v];
         __syncthreads();
-        const int c = threadIdx.x;   // THREADS == COLS
-        const int gc = blockIdx.x * COLS + c;
-        if (gc < n)
+        for (int c = threadIdx.x; c < BC; c += THREADS)
         {
-            float s = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < WARPS; ++w) s += red[w][c];
-            out[(size_t) i * n + gc] = s;
+            const int gc = blockIdx.x * BC + c;
+            if (gc < n)
+            {
+                float s = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPS; ++w) s += red[w][c];
+                out[(size_t) i * n + gc] = s;
+            }
         }
         __syncthreads();
     }
@@ -993,15 +999,25 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
         if (st != cudaStreamCaptureStatusNone) return false;
         cuda_check(cudaMalloc((void**) &g_ws[dev], WS_BYTES));
     }
-    const int cblocks = (n + COLS - 1) / COLS;
-    int ksplit = std::max(1, TARGET_BLOCKS / cblocks);
+    // M >= 5: 4 columns per lane halves the accumulators (more loads in flight); EXL3_WIDE_V4_MIN_M overrides
+    static int v4_min = -1;
+    if (v4_min < 0) { const char* e = getenv("EXL3_WIDE_V4_MIN_M"); v4_min = e ? atoi(e) : 99; }   // off: measured slower on gfx1151
+    const bool v4 = m >= v4_min;
+    const int bcols = v4 ? 32 * 4 : COLS;
+    const int cblocks = (n + bcols - 1) / bcols;
+    static int tblocks = -1;
+    if (tblocks < 0) { const char* e = getenv("EXL3_WIDE_BLOCKS"); tblocks = e ? std::max(1, atoi(e)) : TARGET_BLOCKS; }
+    int ksplit = std::max(1, tblocks / cblocks);
     int kc = (k + ksplit - 1) / ksplit;
     kc = std::min(MAX_KC, std::max(64, ((kc + 4 * WARPS - 1) / (4 * WARPS)) * (4 * WARPS)));
     ksplit = (k + kc - 1) / kc;
     if ((size_t) ksplit * m * n * sizeof(float) > WS_BYTES) return false;
     float* part = g_ws[dev];
     dim3 grid(cblocks, ksplit);
-    #define WD_CASE(MM) case MM: wide_partials_kernel<MM><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, kc); break;
+    #define WD_CASE(MM) case MM: \
+        if (v4) wide_partials_kernel<MM, 4><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, kc); \
+        else    wide_partials_kernel<MM, 8><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, kc); \
+        break;
     switch (m) { WD_CASE(1) WD_CASE(2) WD_CASE(3) WD_CASE(4) WD_CASE(5) WD_CASE(6) WD_CASE(7) WD_CASE(8) default: return false; }
     #undef WD_CASE
     const int total = m * n;

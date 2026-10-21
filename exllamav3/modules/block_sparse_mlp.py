@@ -2138,6 +2138,34 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return self.ep if self.ep is not None else params["backend"]
 
 
+    def _ep_slice_shared(self, se, ep):
+        from .mlp import GatedMLP
+        if (
+            os.environ.get("KYOJIN_EP_SHARED_SPLIT", "1") == "0" or not isinstance(se, GatedMLP) or
+            se.num_slices != 1 or se.intermediate_size % (128 * ep.world) or not se.gates
+        ):
+            return None
+        I, H = se.intermediate_size, se.hidden_size
+        n = I // ep.world
+        a = ep.rank * n
+        g0, u0, d0 = se.gates[0], se.ups[0], se.downs[0]
+        def col(l):
+            return Linear(config = self.config, key = l.key, in_features = H, out_features = n,
+                          full_in_features = H, full_out_features = I, first_in_feature = 0, first_out_feature = a,
+                          qmap = None, out_dtype = se.interm_dtype, pad_to = se.pad_to)
+        down = Linear(config = self.config, key = d0.key, in_features = n, out_features = H,
+                      full_in_features = I, full_out_features = H, first_in_feature = a, first_out_feature = 0,
+                      qmap = None, out_dtype = se.out_dtype, allow_input_padding = True, pad_to = se.pad_to)
+        gate, up = col(g0), col(u0)
+        mlp = GatedMLP(config = self.config, key = se.key, hidden_size = H, intermediate_size = n,
+                       activation_fn = se.activation_fn, interm_dtype = se.interm_dtype, out_dtype = se.out_dtype,
+                       act_limit = se.act_limit, pad_to = se.pad_to, gates = [gate], ups = [up], downs = [down])
+        # Explicitly passed Linears are not registered by GatedMLP (the TP importer loads them itself)
+        for m in (up, gate, down):
+            mlp.register_submodule(m)
+        return mlp
+
+
     def ep_maybe_split(self, device):
         """Cross-host expert parallel (model/ep.py): keep this rank's contiguous expert range, ordered first, so
         the module looks like a head slice [0, n) of a permuted expert list. The router columns and score bias are
@@ -2166,9 +2194,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             drop |= set(self.gates[e] for e in remote)
         self._split_saved = (self.gates, self.ups, self.downs, self.modules,
                              self.num_local_experts, self.routing_first, self.routing_last)
-        if ep.rank != 0 and self.shared_experts is not None:
-            drop.add(self.shared_experts)
-            self.shared_experts = None
+        se = self.shared_experts
+        if se is not None:
+            sliced = self._ep_slice_shared(se, ep)
+            if sliced is not None:
+                # Each rank keeps its 128-aligned share of the shared expert's intermediate channels; the
+                # down projection's partial joins the routed partial in the same all-reduce
+                self.modules[self.modules.index(se)] = sliced
+                self.shared_experts = sliced
+            elif ep.rank != 0:
+                drop.add(se)
+                self.shared_experts = None
         if self.gated:
             self.gates = [self.gates[e] for e in local]
         self.ups = [self.ups[e] for e in local]

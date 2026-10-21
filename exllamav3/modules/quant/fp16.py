@@ -47,9 +47,10 @@ class LinearFP16:
         self.out_dtype = out_dtype
         self.key = key
 
-        if self.weight.shape[0] == full_in_features and self.weight.shape[0] < in_features:
+        # Sliced loads arrive as the full tensor: cut to [first, first + features) when narrower than full
+        if full_in_features is not None and self.weight.shape[0] == full_in_features and in_features < full_in_features:
             self.weight = self.weight[first_in_feature : first_in_feature + in_features, :]
-        if self.weight.shape[1] == full_out_features and self.weight.shape[1] < out_features:
+        if full_out_features is not None and self.weight.shape[1] == full_out_features and out_features < full_out_features:
             self.weight = self.weight[:, first_out_feature : first_out_feature + out_features]
             if bias is not None:
                 self.bias = self.bias[..., first_out_feature : first_out_feature + out_features]

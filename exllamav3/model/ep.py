@@ -24,6 +24,7 @@ class EPState:
         self.rank = rank
         self.world = world
         self.reduces = 0
+        self.bf16_min = int(os.environ.get("KYOJIN_EP_BF16_MIN", 64 * 4096))
 
     def expert_range(self, num_experts: int) -> tuple[int, int]:
         assert num_experts % self.world == 0, \
@@ -40,6 +41,14 @@ class EPState:
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
         if not contribution:
             tensor.zero_()
+        # Large fp32 payloads (prefill chunks) go over the wire as bf16: half the bytes on a ~2 GB/s link.
+        # Every rank gets the same rounded sum, so the ranks stay identical. KYOJIN_EP_BF16_MIN=0 disables
+        if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min:
+            t = tensor.to(torch.bfloat16)
+            dist.all_reduce(t)
+            tensor.copy_(t)
+            self.reduces += 1
+            return
         if tensor.is_contiguous():
             dist.all_reduce(tensor)
         else:

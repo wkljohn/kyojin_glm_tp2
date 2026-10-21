@@ -821,6 +821,202 @@ void skinny_cat_w(at::Tensor a, std::vector<at::Tensor> ws, std::vector<at::Tens
 
 void skinny_set_onepass(int64_t on) { skinny::g_onepass = on ? 1 : 0; }
 
+/*
+wide: M <= 8 rows against a wide row-major fp16 weight [k, n] (n > skinny::MAX_N, n % 8 == 0). At decode the
+weight read is the whole cost; hipBLASLt's tile GEMMs reach ~135 GB/s on these shapes (GLM-5.3-Flash BF16
+attention / shared expert / head: ~113 ms of a 144 ms token). Each lane streams 16-byte rows of 8 columns, a
+block covers 256 columns x a k-chunk with its 8 warps on interleaved rows, the a rows of the chunk sit in LDS,
+and k-split partials are summed in fixed y order by a second launch: deterministic, independent of timing.
+EXL3_HIP_WIDE_GEMV=0 disables.
+*/
+namespace wide
+{
+
+constexpr int WARPS = 8;
+constexpr int THREADS = WARPS * 32;
+constexpr int VEC = 8;                       // columns per lane (one 16-byte load)
+constexpr int COLS = 32 * VEC;               // columns per block
+constexpr int MAX_M = 8;
+constexpr int MAX_KC = 1024;                 // k rows per block (LDS: MAX_M * MAX_KC halves = 16 KiB)
+constexpr int TARGET_BLOCKS = 320;           // ~8 blocks per CU on 40 CUs
+constexpr size_t WS_BYTES = 48u << 20;       // partials workspace per device
+static float* g_ws[MAX_DEVICES] = {};
+
+static bool enabled()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char* e = getenv("EXL3_HIP_WIDE_GEMV");
+        cached = (e && *e == '0') ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+template <int M>
+__global__ __launch_bounds__(THREADS)
+void wide_partials_kernel
+(
+    const half* __restrict__ a,   // [M, k], row stride lda
+    const half* __restrict__ b,   // [k, n]
+    float* __restrict__ part,     // [ksplit, M, n]
+    const int k,
+    const int n,
+    const int lda,
+    const int kc                  // k rows per block, multiple of WARPS
+)
+{
+    __shared__ half sa[M][MAX_KC];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int k0 = blockIdx.y * kc;
+    const int k1 = min(k0 + kc, k);
+    for (int idx = threadIdx.x; idx < M * kc; idx += THREADS)
+    {
+        const int i = idx / kc, kk = idx % kc;
+        sa[i][kk] = (k0 + kk < k) ? a[(size_t) i * lda + k0 + kk] : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    const int col = blockIdx.x * COLS + lane * VEC;
+    const bool active = col < n;
+    float acc[M][VEC];
+    #pragma unroll
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) acc[i][v] = 0.0f;
+
+    if (active)
+    {
+        const half* bp = b + col;
+        int kk = k0 + warp;
+        // four rows in flight per lane
+        for (; kk + 3 * WARPS < k1; kk += 4 * WARPS)
+        {
+            uint4 r[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) r[u] = *((const uint4*) (bp + (size_t) (kk + u * WARPS) * n));
+            #pragma unroll
+            for (int u = 0; u < 4; ++u)
+            {
+                const half2* h = (const half2*) &r[u];
+                float2 f[4];
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) f[q] = __half22float2(h[q]);
+                #pragma unroll
+                for (int i = 0; i < M; ++i)
+                {
+                    const float av = __half2float(sa[i][kk + u * WARPS - k0]);
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q)
+                    {
+                        acc[i][2 * q] = fmaf(av, f[q].x, acc[i][2 * q]);
+                        acc[i][2 * q + 1] = fmaf(av, f[q].y, acc[i][2 * q + 1]);
+                    }
+                }
+            }
+        }
+        for (; kk < k1; kk += WARPS)
+        {
+            const uint4 r = *((const uint4*) (bp + (size_t) kk * n));
+            const half2* h = (const half2*) &r;
+            #pragma unroll
+            for (int i = 0; i < M; ++i)
+            {
+                const float av = __half2float(sa[i][kk - k0]);
+                #pragma unroll
+                for (int q = 0; q < 4; ++q)
+                {
+                    const float2 f = __half22float2(h[q]);
+                    acc[i][2 * q] = fmaf(av, f.x, acc[i][2 * q]);
+                    acc[i][2 * q + 1] = fmaf(av, f.y, acc[i][2 * q + 1]);
+                }
+            }
+        }
+    }
+
+    // reduce the 8 warps' row slices through LDS, one row of M at a time (fixed order)
+    __shared__ float red[WARPS][COLS];
+    float* out = part + (size_t) blockIdx.y * M * n;
+    #pragma unroll
+    for (int i = 0; i < M; ++i)
+    {
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) red[warp][lane * VEC + v] = acc[i][v];
+        __syncthreads();
+        const int c = threadIdx.x;   // THREADS == COLS
+        const int gc = blockIdx.x * COLS + c;
+        if (gc < n)
+        {
+            float s = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) s += red[w][c];
+            out[(size_t) i * n + gc] = s;
+        }
+        __syncthreads();
+    }
+}
+
+template <typename C_T>
+__global__ void wide_reduce_kernel(const float* __restrict__ part, C_T* __restrict__ c, int m, int n, int ksplit, int ldc)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    const int i = idx / n, col = idx % n;
+    float s = 0.0f;
+    for (int y = 0; y < ksplit; ++y) s += part[((size_t) y * m + i) * n + col];
+    if constexpr (std::is_same_v<C_T, float>) c[(size_t) i * ldc + col] = s;
+    else c[(size_t) i * ldc + col] = __float2half(s);
+}
+
+static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream)
+{
+    if (!enabled()) return false;
+    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kFloat && c.dtype() != at::kHalf) return false;
+    if (b.dim() != 2 || !b.is_contiguous()) return false;
+    const int k = a.size(-1);
+    const int m = a.numel() / k;
+    const int n = b.size(-1);
+    if (m < 1 || m > MAX_M || n <= skinny::MAX_N || n % VEC || k < 64) return false;
+    if (((uintptr_t) b.data_ptr()) % 16) return false;
+    if (a.stride(-1) != 1 || c.stride(-1) != 1) return false;
+    if (a.dim() > 2 && !a.is_contiguous()) return false;
+    const int lda = a.dim() == 1 ? k : (int) a.stride(-2);
+    const int ldc = c.dim() == 1 ? n : (int) c.stride(-2);
+    const int dev = a.device().index();
+    if (dev < 0 || dev >= MAX_DEVICES) return false;
+    if (!g_ws[dev])
+    {
+        cudaStreamCaptureStatus st;
+        cuda_check(cudaStreamIsCapturing(stream, &st));
+        if (st != cudaStreamCaptureStatusNone) return false;
+        cuda_check(cudaMalloc((void**) &g_ws[dev], WS_BYTES));
+    }
+    const int cblocks = (n + COLS - 1) / COLS;
+    int ksplit = std::max(1, TARGET_BLOCKS / cblocks);
+    int kc = (k + ksplit - 1) / ksplit;
+    kc = std::min(MAX_KC, std::max(64, ((kc + 4 * WARPS - 1) / (4 * WARPS)) * (4 * WARPS)));
+    ksplit = (k + kc - 1) / kc;
+    if ((size_t) ksplit * m * n * sizeof(float) > WS_BYTES) return false;
+    float* part = g_ws[dev];
+    dim3 grid(cblocks, ksplit);
+    #define WD_CASE(MM) case MM: wide_partials_kernel<MM><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, kc); break;
+    switch (m) { WD_CASE(1) WD_CASE(2) WD_CASE(3) WD_CASE(4) WD_CASE(5) WD_CASE(6) WD_CASE(7) WD_CASE(8) default: return false; }
+    #undef WD_CASE
+    const int total = m * n;
+    const int rblocks = (total + 255) / 256;
+    if (c.dtype() == at::kFloat)
+        wide_reduce_kernel<float><<<rblocks, 256, 0, stream>>>(part, (float*) c.data_ptr(), m, n, ksplit, ldc);
+    else
+        wide_reduce_kernel<half><<<rblocks, 256, 0, stream>>>(part, (half*) c.data_ptr(), m, n, ksplit, ldc);
+    cuda_check(cudaPeekAtLastError());
+    return true;
+}
+
+} // namespace wide
+
+
 #endif // USE_ROCM
 
 void hgemm_gr
@@ -834,6 +1030,7 @@ void hgemm_gr
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 #if defined(USE_ROCM)
     if (skinny::try_launch(a, b, c, stream)) return;
+    if (wide::try_launch(a, b, c, stream)) return;
     if (!graph && dtune::try_launch(a, b, c, stream, [&]{ hgemm_gemmex_impl(a, b, c, stream); })) return;
 #endif
     hgemm_gemmex_impl(a, b, c, stream);

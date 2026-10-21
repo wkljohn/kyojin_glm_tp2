@@ -44,4 +44,5 @@ source tools/strix_halo/env.sh
 
 ulimit -l unlimited 2>/dev/null || true
 echo "[ep_launch] rank $KYOJIN_EP_RANK/$KYOJIN_EP_WORLD hca $NCCL_IB_HCA gid $NCCL_IB_GID_INDEX master $MASTER_ADDR:$MASTER_PORT" >&2
-exec "$ROOT/.venv/bin/python" "$@"
+# EP_WRAP: optional profiler prefix, e.g. "rocprofv3 --kernel-trace --output-format csv -d DIR --"
+exec ${EP_WRAP:-} "$ROOT/.venv/bin/python" "$@"

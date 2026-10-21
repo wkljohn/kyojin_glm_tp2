@@ -7,15 +7,25 @@ RoCE v2. The model is not in this package; download it on both hosts (below).
 Source: fork `wkljohn/kyojin_glm_tp2`, branch `research/glm53-exl3-tp2-20261021`; the commit is in `source/COMMIT`.
 Design and measurements: `doc/ep_tp2.md` in the source.
 
-## Measured (reference deployment, 2026-10-21)
+## Measured (reference pair, 2026-10-21, 8-family bench, 2048-token prompts, 256 tokens, DFlash2 + n-gram)
 
-| | |
-|---|---|
-| Prefill, 2048-token prompts (8-family bench) | 729 t/s |
-| Decode, same bench (DFlash2 + n-gram lookup) | 28.5 t/s mean (17.8 prose .. 47.2 recall) |
-| Live agent traffic (opencode, prompts up to 72K) | prefill ~690 t/s uncached, 75 % prompt-cache hits, decode ~20 t/s |
-| Context | 131072 tokens, ~32 GiB free per host |
-| Startup | ~62 s load + ~20 s warm-up |
+| | previous package (9a76bdd) | this package (`KYOJIN_EP_SHARE=0.53`, `KYOJIN_Q8_LINEAR=1`) |
+|---|---|---|
+| Prefill | 729 t/s | 740 t/s (806 without the drafter loaded) |
+| Decode | 27.4-28.5 t/s mean | 33.4 t/s mean (22.6 prose .. 54.3 recall) |
+| Verify round | 143 ms | 118.5 ms |
+| Memory per host | ~32 GiB free at 128K context | ~4 GiB more free on rank 1, about the same on rank 0 |
+| Startup | ~62 s load + ~20 s warm-up | + ~10 s Q8 conversion at load |
+
+What changed (source commit in `source/COMMIT`):
+- **Prefill two-batch overlap**: each prefill chunk runs as two halves interleaved at the all-reduces, so one half's
+  network transfer overlaps the other half's compute (always on; `KYOJIN_EP_TBO=0` disables).
+- **Weighted split** (`KYOJIN_EP_SHARE`): rank 0 takes that share of experts, heads, channels and vocabulary. Lets a
+  host with more sustained compute do more of the work (see "Tuning the split").
+- **Q8 linears** (`KYOJIN_Q8_LINEAR`): the BF16 attention / shared expert / dense / lm_head / drafter weights are
+  converted at load to 8-bit with an fp16 scale per 64 rows (llama.cpp Q8_0 class). Decode reads half the bytes.
+- **Settings check**: at start both ranks compare every setting that changes what they compute and refuse to start
+  if one differs (`EP settings differ across hosts: ...`).
 
 ## What each host needs
 
@@ -88,6 +98,11 @@ Always start and stop the pair together. Rank 0 serves HTTP; rank 1 has no liste
   - After every request, finished or cancelled, both ranks compare a digest of the generated tokens. A mismatch
     marks the pair faulted and every later request gets HTTP 503 until restart.
   - Report any `FAULT` line.
+- **Accuracy (Q8)**: logits over the 8 bench texts compared with BF16, at 1K and 6K tokens. KL(BF16 || Q8) is
+  0.139 / 0.338 nats per token overall, the same size as the difference between two BF16 builds that only sum in a
+  different order (0.125 / 0.328); top-1 agreement 0.93; NLL within +-1 %. Two families (identifier-heavy dossier,
+  long math) differ a lot between any two numeric variants, BF16 included (DSA top-k selection flips). Set
+  `KYOJIN_Q8_LINEAR=0` for the unmodified BF16 weights.
 - **Diagnostics** (env in `/etc/kyojin-ep.env`, off by default): `KYOJIN_EP_DRAFT_DEBUG=1` makes rank 1 log every
   round where its own drafter output differed from rank 0's (rank 0's is always used).
 - **No image input** (HTTP 400). Vision is not loaded in the EP server.
@@ -98,6 +113,19 @@ Always start and stop the pair together. Rank 0 serves HTTP; rank 1 has no liste
   (Prometheus text, llama.cpp names).
 - **Licenses**: the DFlash2 drafter is CC BY-NC-ND 4.0 (non-commercial). Check the model pack's own LICENSE.
 
+## Tuning the split
+
+`KYOJIN_EP_SHARE` should match the hosts' relative sustained GPU compute. On each host:
+
+```bash
+cd /opt/kyojin-glm-tp2/kyojin_glm_tp2 && EXL3_ROCM_SDK=/opt/kyojin-glm-tp2/runtime/lib/python3.14/site-packages/_rocm_sdk_devel \
+    bash -c 'source tools/strix_halo/env.sh; .venv/bin/python tools/glm/gpu_speed_probe.py'   # service stopped
+```
+
+With GEMM throughputs T0 (rank 0) and T1 (rank 1): share = T0 / (T0 + T1), rounded to 0.50 / 0.53 / 0.56. Reference
+pair: 36.3 and 30.3 TFLOPS gives 0.545; 0.53 measured best (0.50: decode 31.8, 0.56: decode 33.5 but no faster
+rounds). Equal hosts: 0.5. The value must be the same in both `/etc/kyojin-ep.env` files.
+
 ## Updating
 
 A new package differs from the old one in `source/` (and maybe `deploy/`); the runtime only changes if its checksum
@@ -107,6 +135,14 @@ does. Copy the new package over the old one with `rsync -a` (only the changed fi
 PEER=user@<rank-1 host> ./deploy/update.sh . /opt/kyojin-glm-tp2   # stops both, syncs the package to the peer
                                                                    # (without runtime/), updates both, starts both
 ./deploy/smoke_test.sh http://127.0.0.1:8083
+```
+
+**From the 9a76bdd package**: add the two new settings to `/etc/kyojin-ep.env` on both hosts before running
+update.sh (without them the new code runs like the old layout: share 0.5, BF16 weights):
+
+```
+KYOJIN_EP_SHARE=0.53      # or the value from "Tuning the split"
+KYOJIN_Q8_LINEAR=1
 ```
 
 The previous tree stays at `/opt/kyojin-glm-tp2/kyojin_glm_tp2.prev`. To roll back, stop both ranks, swap the two
@@ -131,7 +167,8 @@ directories on both hosts, and start them again.
 - Validated only on the reference pair (same kernel, ROCm runtime and NIC). The prebuilt extension targets gfx1151 and
   the shipped torch 2.13 / ROCm 10 runtime; rebuilding needs `tools/strix_halo/env.sh build` with that runtime's
   `_rocm_sdk_devel`.
-- No formal accuracy gate against an unsplit reference yet; the two ranks agree bit-for-bit and outputs were checked by
-  hand. Speculative decoding can change greedy text at near-ties.
+- Accuracy is gated at the logit level (Q8 vs BF16, `tools/glm/ep_logits.py`), not against an unsplit single-host
+  reference (the model does not fit one host); the two ranks agree bit-for-bit. Speculative decoding and any change of
+  summation order can change greedy text at near-ties.
 - A crash of either rank takes the pair down; `Restart=on-failure` restarts the crashed side, but if the pair does not
   re-form within a minute, run `restart.sh`.

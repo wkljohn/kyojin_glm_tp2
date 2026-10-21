@@ -1183,7 +1183,7 @@ static bool try_launch_q8(const at::Tensor& a, const at::Tensor& qw, const at::T
     }
     const int cblocks = (n + COLS - 1) / COLS;
     static int tblocks = -1;
-    if (tblocks < 0) { const char* e = getenv("EXL3_WIDE_BLOCKS"); tblocks = e ? std::max(1, atoi(e)) : TARGET_BLOCKS; }
+    if (tblocks < 0) { const char* e = getenv("EXL3_Q8_BLOCKS"); tblocks = e ? std::max(1, atoi(e)) : TARGET_BLOCKS; }
     int ksplit = std::max(1, tblocks / cblocks);
     int kc = (k + ksplit - 1) / ksplit;
     kc = std::min(MAX_KC, std::max(Q8_G, ((kc + Q8_G - 1) / Q8_G) * Q8_G));

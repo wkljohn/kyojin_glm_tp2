@@ -325,6 +325,20 @@ def ep_state() -> EPState | None:
         dist.all_reduce(t)
         expect = world * (world + 1) / 2
         assert float(t[0]) == expect, f"EP all-reduce self-test failed: {float(t[0])} != {expect}"
+        # Settings that change what each rank computes must be identical everywhere (a different share or Q8 flag
+        # on one host gives wrong output without any desync): compare them once, fail before loading the model
+        names = ("KYOJIN_EP_SHARE", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
+                 "KYOJIN_EP_BF16_MIN", "KYOJIN_EP_KDA_SPLIT", "KYOJIN_EP_MLA_SPLIT", "KYOJIN_EP_DENSE_SPLIT",
+                 "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP")
+        import zlib
+        cfg = torch.tensor([float(zlib.crc32(os.environ.get(k, "").encode())) for k in names],
+                           dtype = torch.float64, device = device)
+        hi, lo = cfg.clone(), -cfg
+        dist.all_reduce(hi, op = dist.ReduceOp.MAX)
+        dist.all_reduce(lo, op = dist.ReduceOp.MAX)
+        bad = [k for k, h, l in zip(names, hi.tolist(), lo.tolist()) if h != -l]
+        if bad:
+            raise EPDesync(f"rank {rank}: EP settings differ across hosts: {', '.join(bad)} (set them identically)")
         torch.cuda.synchronize()
     _STATE = EPState(rank, world)
     print(f" -- EP rank {rank}/{world} ready (torch.distributed nccl)", flush = True)

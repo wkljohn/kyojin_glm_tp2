@@ -156,6 +156,8 @@ def main():
     ap.add_argument("--draft", default = None, help = "draft model directory (DFlash / DFlash2)")
     ap.add_argument("--num-draft", type = int, default = 0)
     ap.add_argument("--label", default = "")
+    ap.add_argument("--dynamic-draft", action = "store_true", help = "calibrated confidence truncation of the draft window")
+    ap.add_argument("--draft-confidence", type = float, default = 0.4)
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
@@ -189,7 +191,8 @@ def main():
     free, total = torch.cuda.mem_get_info()
     generator = Generator(model = model, cache = cache, tokenizer = tokenizer,
                           draft_model = draft_model, draft_cache = draft_cache,
-                          num_draft_tokens = args.num_draft or None)
+                          num_draft_tokens = args.num_draft or None,
+                          dynamic_draft_tokens = args.dynamic_draft, draft_confidence = args.draft_confidence)
 
     def run_case(ids):
         job = Job(input_ids = ids, max_new_tokens = args.gen_tokens, min_new_tokens = args.gen_tokens,
@@ -252,6 +255,7 @@ def main():
             v = [r[k] for r in rows if r[k] is not None]
             return round(sum(v) / len(v), 3) if v else None
         summary = dict(label = args.label, model = args.model, draft = args.draft, num_draft = args.num_draft,
+                       dynamic_draft = args.dynamic_draft, draft_confidence = args.draft_confidence,
                        world = world, prompt_tokens = args.prompt_tokens, gen_tokens = args.gen_tokens,
                        load_s = round(load_s, 1), device_free_gib = round(free / 2**30, 1),
                        prefill_tps_mean = mean("prefill_tps"), decode_tps_mean = mean("decode_tps"),

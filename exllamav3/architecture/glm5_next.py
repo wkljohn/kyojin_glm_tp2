@@ -236,6 +236,31 @@ class Glm5NextModel(Model):
                 attn.ep = ep
                 attn.tp_reduce = True
 
+            dense_mlp = None
+            if config.mlp_layer_types[idx] == "dense":
+                dense_mlp = GatedMLP(
+                    config = config,
+                    key = f"{key}.mlp",
+                    hidden_size = config.hidden_size,
+                    intermediate_size = config.intermediate_size,
+                    key_up = "up_proj",
+                    key_gate = "gate_proj",
+                    key_down = "down_proj",
+                    activation_fn = "silu",
+                    act_limit = config.swiglu_limit,
+                    qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.float,
+                    select_hq_bits = 1,
+                )
+                if ep is not None and os.environ.get("KYOJIN_EP_DENSE_SPLIT", "1") != "0":
+                    from ..modules.mlp import ep_slice_gated_mlp
+                    sliced = ep_slice_gated_mlp(dense_mlp, ep, config)
+                    if sliced is not None:
+                        dense_mlp = sliced
+                        dense_mlp.ep = ep
+                        dense_mlp.tp_reduce = True
+
             def _hc(tag: str):
                 return HyperConnection(
                     config = config,
@@ -265,21 +290,7 @@ class Glm5NextModel(Model):
                         rms_norm_eps = config.rms_norm_eps,
                     ),
                     mlp = (
-                        GatedMLP(
-                            config = config,
-                            key = f"{key}.mlp",
-                            hidden_size = config.hidden_size,
-                            intermediate_size = config.intermediate_size,
-                            key_up = "up_proj",
-                            key_gate = "gate_proj",
-                            key_down = "down_proj",
-                            activation_fn = "silu",
-                            act_limit = config.swiglu_limit,
-                            qmap = "block.mlp",
-                            interm_dtype = torch.half,
-                            out_dtype = torch.float,
-                            select_hq_bits = 1,
-                        )
+                        dense_mlp
                         if config.mlp_layer_types[idx] == "dense" else
                         BlockSparseMLP(
                             config = config,

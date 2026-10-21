@@ -290,7 +290,7 @@ class MLP(Module):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                (getattr(self, "ep", None) or params["backend"]).all_reduce(d)
             return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
@@ -312,7 +312,7 @@ class MLP(Module):
             del d_
 
         if self.tp_reduce:
-            params["backend"].all_reduce(d)
+            (getattr(self, "ep", None) or params["backend"]).all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -750,7 +750,7 @@ class GatedMLP(Module):
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(d, False)
+                (getattr(self, "ep", None) or params["backend"]).all_reduce(d, False)
         else:
             qs = params.get("q_mlp_slice")
             r = [qs] if qs is not None else range(0, self.num_slices)
@@ -850,7 +850,7 @@ class GatedMLP(Module):
                     del d_
 
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                (getattr(self, "ep", None) or params["backend"]).all_reduce(d)
 
         if nc2_half and d.dtype == torch.half:
             return d
@@ -974,3 +974,31 @@ class GatedMLP(Module):
             module.load_local(device, i)
         torch.cuda.synchronize()
         return module
+
+
+def ep_slice_gated_mlp(se: "GatedMLP", ep, config = None) -> "GatedMLP | None":
+    """Cross-host shard of an (unloaded) single-slice GatedMLP: this rank keeps its 128-aligned share of the
+    intermediate channels (gate/up output columns, down input rows). The caller sums the down partials across
+    ranks (MoE all-reduce for a shared expert, tp_reduce + ep for a standalone MLP). None if not shardable."""
+    if not isinstance(se, GatedMLP) or se.num_slices != 1 or not se.gates or se.intermediate_size % (128 * ep.world):
+        return None
+    config = config or se.config
+    I, H = se.intermediate_size, se.hidden_size
+    n = I // ep.world
+    a = ep.rank * n
+    g0, u0, d0 = se.gates[0], se.ups[0], se.downs[0]
+    def col(l):
+        return Linear(config = config, key = l.key, in_features = H, out_features = n,
+                      full_in_features = H, full_out_features = I, first_in_feature = 0, first_out_feature = a,
+                      qmap = None, out_dtype = se.interm_dtype, pad_to = se.pad_to)
+    down = Linear(config = config, key = d0.key, in_features = n, out_features = H,
+                  full_in_features = I, full_out_features = H, first_in_feature = a, first_out_feature = 0,
+                  qmap = None, out_dtype = se.out_dtype, allow_input_padding = True, pad_to = se.pad_to)
+    gate, up = col(g0), col(u0)
+    mlp = GatedMLP(config = config, key = se.key, hidden_size = H, intermediate_size = n,
+                   activation_fn = se.activation_fn, interm_dtype = se.interm_dtype, out_dtype = se.out_dtype,
+                   act_limit = se.act_limit, pad_to = se.pad_to, gates = [gate], ups = [up], downs = [down])
+    # Explicitly passed Linears are not registered by GatedMLP (the TP importer loads them itself)
+    for m in (up, gate, down):
+        mlp.register_submodule(m)
+    return mlp

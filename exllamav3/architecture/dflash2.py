@@ -192,13 +192,14 @@ class DFlash2Selector(Module):
         scores = unary.unsqueeze(2) + torch.einsum("blpr,blcr->blpc", pred * h.unsqueeze(2), succ)
         rows = torch.arange(b, device = cand.device)
         p = torch.zeros(b, dtype = torch.long, device = cand.device)
-        path = []
+        path, conf = [], []
         for step in range(L):
             s = scores[rows, step, p]                                                # (b, k)
             sel = s.argmax(dim = -1)
             path.append(cand[rows, step, sel])
+            conf.append(s[rows, sel])
             p = sel
-        return torch.stack(path, dim = 1)
+        return torch.stack(path, dim = 1), torch.stack(conf, dim = 1)
 
 
 class DFlash2Model(DFlashModel):
@@ -252,8 +253,10 @@ class DFlash2Model(DFlashModel):
             logits = torch.tanh(logits / cfg.final_logit_softcapping) * cfg.final_logit_softcapping
         unary, cand = logits.topk(cfg.selector_top_k, dim = -1)
         anchor = params["dflash2_anchor"].to(state.device)
-        path = self.selector.select(cand, unary, hidden.half(), anchor)
+        path, conf = self.selector.select(cand, unary, hidden.half(), anchor)
         if params.get("export_draft_conf"):
-            params["draft_conf"] = torch.cat((unary[:, :1, 0], unary[:, :, 0]), dim = 1)
+            # Per-position confidence for the generator's calibrated draft truncation: the selector score of the
+            # chosen edge (column 0 is the anchor position the generator drops)
+            params["draft_conf"] = torch.cat((conf[:, :1], conf), dim = 1)
         # The generator drops column 0 (the anchor position)
         return torch.cat((anchor.view(-1, 1), path), dim = 1)

@@ -14,7 +14,9 @@ Design and measurements: `doc/ep_tp2.md` in the source.
 | Prefill | 729 t/s | 740 t/s (806 without the drafter loaded) |
 | Decode | 27.4-28.5 t/s mean | 33.4 t/s mean (22.6 prose .. 54.3 recall) |
 | Verify round | 143 ms | 118.5 ms |
-| Memory per host | ~32 GiB free at 128K context | ~4 GiB more free on rank 1, about the same on rank 0 |
+| Prefill, 29.5K-token agent prompt | ~690 t/s | 871 t/s |
+| Memory after load (rank 0 / rank 1) | 86.6 / 86.6 GiB | 87.8 / 78.2 GiB (both hosts together -7.3 GiB) |
+| Free at 128K context (rank 0 / rank 1) | ~32 / ~32 GiB | ~22 / ~31 GiB |
 | Startup | ~62 s load + ~20 s warm-up | + ~10 s Q8 conversion at load |
 
 What changed (source commit in `source/COMMIT`):

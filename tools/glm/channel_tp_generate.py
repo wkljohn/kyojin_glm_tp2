@@ -20,6 +20,8 @@ from exllamav3.constants import PAGE_SIZE
 from exllamav3.ext import exllamav3_ext
 from exllamav3.model.glm_channel_tp import configure_glm_channel_tp
 from exllamav3.model.rank_collectives import RankCollectives
+from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+from exllamav3.modules.quant import exl3 as exl3_quant
 
 
 @torch.inference_mode()
@@ -88,6 +90,16 @@ def run(args):
 
         model.load(device="cuda:0", callback=loaded)
         report["allocated_weight_and_cache_bytes"] = torch.cuda.memory_allocated()
+        report["routed_shards"] = []
+        for module in model:
+            if isinstance(module, BlockSparseMLP):
+                linears = module.gates + module.ups + module.downs
+                report["routed_shards"].append({
+                    "key": module.key, "expert_count": module.num_local_experts,
+                    "intermediate_size": module.intermediate_size,
+                    "shared_expert": module.shared_experts is not None,
+                    "trellis_bytes": sum(l.inner.trellis.numel() * l.inner.trellis.element_size() for l in linears),
+                })
         dist.barrier()
         previous_outputs = {}
         for prompt, ids in requests:
@@ -142,6 +154,9 @@ def run(args):
                     raise AssertionError("Greedy output changed after independent request reset")
             previous_outputs[prompt] = list(generated)
             report["requests"].append(record)
+            report["expanded_weight_cache_bytes"] = exl3_quant._had_cache_bytes
+            if report["expanded_weight_cache_bytes"] != 0:
+                raise AssertionError("Persistent expanded-weight cache must remain empty")
             if backend.rank == 0:
                 print(json.dumps(record, ensure_ascii=False), flush=True)
         report["complete"] = True

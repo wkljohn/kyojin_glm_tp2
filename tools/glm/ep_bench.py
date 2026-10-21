@@ -210,7 +210,8 @@ def main():
         return toks, last, "".join(text), time.perf_counter() - t
 
     # Warm-up: kernel JIT, allocator growth, first-use tuning (not reported)
-    warm = build_ids(tokenizer, "math", min(args.prompt_tokens, 1024))
+    # full prompt length: the first measured case must not pay for new prefill shapes
+    warm = build_ids(tokenizer, "math", args.prompt_tokens)
     run_case(warm)
 
     fams = [f.strip() for f in args.families.split(",") if f.strip()]

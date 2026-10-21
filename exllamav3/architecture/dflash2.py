@@ -99,6 +99,9 @@ class DFlash2GroupedConv(Module):
     def finish(self, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         return self._convolve(y, c, 1)
 
+    def optimizer_targets(self):
+        return []
+
     def forward(self, x, params, out_dtype = None):
         raise NotImplementedError()
 
@@ -172,6 +175,9 @@ class DFlash2Selector(Module):
     @override
     def weights_numel(self):
         return super().weights_numel() + 2 * self.config.vocab_size * self.config.selector_rank
+
+    def optimizer_targets(self):
+        return []
 
     def forward(self, x, params, out_dtype = None):
         return x

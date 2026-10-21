@@ -804,10 +804,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             0.0 <= self.act_limit <= 65504.0 and self.tp_mode is None and self.latent_in is None and
             self.hidden_size % 128 == 0 and self.intermediate_size_padded % 128 == 0 and
             self.ups[0].in_features == self.hidden_size and self.downs[0].out_features == self.hidden_size and
-            len(self.ups) == self.num_experts and
-            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
-            (self.routing_first is None or (self.routing_first == 0 and self.routing_last == self.num_experts)) and
-            self.cpu_split_first is None and not self.cpu_offload and
+            ((
+                len(self.ups) == self.num_experts and
+                (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
+                (self.routing_first is None or (self.routing_first == 0 and self.routing_last == self.num_experts)) and
+                self.cpu_split_first is None
+            ) or (
+                # Cross-host expert parallel head slice: the kernels skip picks >= the table size
+                self.ep is not None and self.routing_first == 0 and
+                len(self.ups) == self.num_local_experts == self.cpu_split_first
+            )) and not self.cpu_offload and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
             not self.config.infer_params.no_reconstruct
@@ -1717,6 +1723,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         ):
             num_tokens, top_k = selected_experts.shape
             sel = selected_experts.contiguous()
+            # Expert-parallel head slice: peer-owned picks go to the sentinel bucket E_local, which sorts
+            # after every local expert; the kernels skip ids >= the pointer table size
+            E_wm = self.num_experts
+            if self.ep is not None:
+                E_wm = self.num_local_experts
+                sel = torch.where(sel < E_wm, sel, torch.full_like(sel, E_wm))
             # fp32 routing weights: the kernel's weighted combine runs in fp32 end to end
             # (fp16 weights rounded here were half the KLD gap vs the per-expert path)
             rw = routing_weights.float().contiguous()
@@ -1724,7 +1736,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             dummy = 0
             y_k, rw_k, sel_k = y, rw, sel
             if _MOE_ALIGN_CHUNK and num_tokens > _MOE_ALIGN_CHUNK:
-                order, flat, dummy = _aligned_expert_layout(flat, num_tokens, top_k, self.num_experts, _MOE_ALIGN_CHUNK)
+                order, flat, dummy = _aligned_expert_layout(flat, num_tokens, top_k, E_wm + (E_wm != self.num_experts), _MOE_ALIGN_CHUNK)
                 # EXL3_MPW_SHORT_A (default 1, read per call, needs the ext flag): the gather reads the dummy rows as zeros,
                 # so y is passed as is instead of copied whole to append them; same gathered bytes
                 if not (hasattr(ext, "EXL3_MPW_SHORT_A") and os.environ.get("EXL3_MPW_SHORT_A", "1") != "0"):
@@ -1734,9 +1746,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 order = flat.argsort(stable = True)
             if _moe_sync_free_count():
-                expert_count = _scatter_expert_count(flat, self.num_experts + 1)
+                expert_count = _scatter_expert_count(flat, E_wm + 1)
             else:
-                expert_count = torch.bincount(flat, minlength = self.num_experts + 1)
+                expert_count = torch.bincount(flat, minlength = E_wm + 1)
             if _HIP_WMMA_STATS is not None:
                 _HIP_WMMA_STATS.append((self.key, expert_count[:self.num_experts].cpu()))
             assignments = (num_tokens + dummy) * top_k
@@ -2135,12 +2147,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         forward(). The shared expert stays on rank 0 only."""
         from ..model.ep import ep_state
         ep = ep_state()
-        if (
-            ep is None or self.ep is not None or device is None or torch.device(device).type != "cuda" or
-            self.num_local_experts != self.num_experts or self.routing_first is not None or
-            self.cpu_split_first is not None or self.latent_in is not None or len(self.ups) != self.num_experts
-        ):
+        if ep is None or self.ep is not None or device is None or torch.device(device).type != "cuda":
             return
+        # Every sparse layer must split identically on all ranks: an unsplit layer would be summed twice and a
+        # rank-dependent branch would desynchronize the collectives
+        assert (
+            self.num_local_experts == self.num_experts and self.routing_first is None and
+            self.cpu_split_first is None and self.latent_in is None and len(self.ups) == self.num_experts and
+            not self.cpu_offload and self.routing_device is None
+        ), f"{self.key}: layer configuration not supported by cross-host expert parallel"
+        assert self.routed_post_norm is None and self.shared_experts_post_norm is None and self.shared_gate is None, \
+            f"{self.key}: post-norms / shared gate need symmetric pre-norm reductions, not supported under EP"
         perm = ep.expert_perm(self.num_experts)
         n = self.num_experts // ep.world
         local, remote = perm[:n], perm[n:]

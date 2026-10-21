@@ -162,7 +162,8 @@ void mpw_gather_had_kernel
     int width,
     int projections,
     int lda,                             // A row pitch (elements, >= width)
-    int a_rows                           // rows of A; token rows past it (aligned-layout padding) read as zero
+    int a_rows,                          // rows of A; token rows past it (aligned-layout padding) read as zero
+    int experts                          // table size: picks outside [0, experts) belong to another shard, skipped
 )
 {
     const int blocks = width / 128;
@@ -180,6 +181,7 @@ void mpw_gather_had_kernel
         const int64_t orig = (int64_t) r * top_k + k;
         const int64_t slot = inverse_order[orig];
         const int64_t e = selected[orig];
+        if (e < 0 || e >= experts) continue;
         const half* suh = (const half*) (proj ? suh_1 : suh_0)[e];
         half4 v = v0;
         mpw_had_h(v, suh + blk * 128, nullptr, t);
@@ -202,7 +204,8 @@ void mpw_act_kernel
     const int64_t* __restrict__ d_suh,
     int assignments,
     int width,
-    float act_limit
+    float act_limit,
+    int experts
 )
 {
     const int blocks = width / 128;
@@ -212,6 +215,7 @@ void mpw_act_kernel
     const int blk = job % blocks;
     const int slot = job / blocks;
     const int64_t e = selected[order[slot]];
+    if (e < 0 || e >= experts) return;   // expert-range shard: sorted past the local experts, never computed
     half* gp = gu + (int64_t) slot * width + blk * 128;
     half* up = gu + ((int64_t) assignments + slot) * width + blk * 128;
     half4 g = ((half4*) gp)[t];
@@ -264,7 +268,8 @@ void mpw_reduce_had_kernel
     int top_k,
     int width,
     const half* __restrict__ addend,
-    int addend_rows
+    int addend_rows,
+    int experts
 )
 {
     const int blocks = width / 128;
@@ -278,6 +283,7 @@ void mpw_reduce_had_kernel
     {
         const int64_t slot = inverse_order[row * top_k + k];
         const int64_t e = selected[row * top_k + k];
+        if (e < 0 || e >= experts) continue;   // another shard's pick: contributes exactly zero here
         const float w = weights[row * top_k + k];
         const float4 fv = ((const float4*) (sorted_rows + slot * width + blk * 128))[t];
         float v0 = fv.x, v1 = fv.y, v2 = fv.z, v3 = fv.w;
@@ -332,7 +338,8 @@ void mpw_gather_had2_kernel
     int top_k,
     int width,
     int lda,
-    int a_rows
+    int a_rows,
+    int experts
 )
 {
     const int blocks = width / 128;
@@ -348,8 +355,11 @@ void mpw_gather_had2_kernel
         const int64_t orig = r * top_k + t;
         slot_l = inverse_order[orig];
         const int64_t e = selected[orig];
-        p0_l = suh_0[e];
-        p1_l = suh_1[e];
+        if (e >= 0 && e < experts)
+        {
+            p0_l = suh_0[e];
+            p1_l = suh_1[e];
+        }
     }
     const half4 v0 = r < a_rows ? ((const half4*) (A + (int64_t) r * lda + blk * 128))[t]
                                 : half4(__float2half2_rn(0.f), __float2half2_rn(0.f));
@@ -359,6 +369,7 @@ void mpw_gather_had2_kernel
         const int64_t slot = mpw_bcast64(slot_l, k);
         const half* s0 = (const half*) mpw_bcast64(p0_l, k);
         const half* s1 = (const half*) mpw_bcast64(p1_l, k);
+        if (!s0) continue;   // another shard's pick (wave-uniform: the pointer is broadcast)
         half4 va = v0, vb = v0;
         mpw_had_h(va, s0 + blk * 128, nullptr, t);
         mpw_had_h(vb, s1 + blk * 128, nullptr, t);
@@ -378,7 +389,8 @@ void mpw_reduce_had2_kernel
     const int64_t* __restrict__ svh_table,
     float* __restrict__ output,
     int rows,
-    int width
+    int width,
+    int experts
 )
 {
     const int blocks = width / 128;
@@ -392,16 +404,21 @@ void mpw_reduce_had2_kernel
     if (t < TK)
     {
         const int64_t orig = row * TK + t;
-        slot_l = inverse_order[orig];
-        p_l = svh_table[selected[orig]];
-        w_l = weights[orig];
+        const int64_t e = selected[orig];
+        if (e >= 0 && e < experts)
+        {
+            slot_l = inverse_order[orig];
+            p_l = svh_table[e];
+            w_l = weights[orig];
+        }
     }
     float4 fv[TK];
     #pragma unroll
     for (int k = 0; k < TK; ++k)
     {
         const int64_t slot = mpw_bcast64(slot_l, k);
-        fv[k] = ((const float4*) (sorted_rows + slot * width + blk * 128))[t];
+        fv[k] = mpw_bcast64(p_l, k) ? ((const float4*) (sorted_rows + slot * width + blk * 128))[t]
+                                    : make_float4(0.f, 0.f, 0.f, 0.f);
     }
     float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
     #pragma unroll
@@ -409,6 +426,7 @@ void mpw_reduce_had2_kernel
     {
         const float w = __shfl(w_l, k, 32);
         const half* svh = (const half*) mpw_bcast64(p_l, k);
+        if (!svh) continue;
         float v0 = fv[k].x, v1 = fv[k].y, v2 = fv[k].z, v3 = fv[k].w;
         float s0 = v0 + v1, d0 = v0 - v1, s1 = v2 + v3, d1 = v2 - v3;
         float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
@@ -1707,14 +1725,14 @@ void exl3_moe_prefill_wmma
         const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
         mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
         ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-         assignments, top_k, H, lda, a_rows);
+         assignments, top_k, H, lda, a_rows, (int) experts);
     }
     else
     {
     const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
     mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
     ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-     assignments, top_k, H, 2, lda, a_rows);
+     assignments, top_k, H, 2, lda, a_rows, (int) experts);
     }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,
@@ -1724,7 +1742,7 @@ void exl3_moe_prefill_wmma
     const int64_t ajobs = (int64_t) assignments * (I / 128);
     mpw_act_kernel<<<CEIL_DIVIDE(ajobs, 8), 256, 0, stream>>>
         ((half*) gu_out.data_ptr(), sel, ord, P(gate_svh), P(up_svh), P(down_suh), assignments, I,
-         (float) act_limit);
+         (float) act_limit, (int) experts);
 
     // down_out = gu_had workspace viewed fp32 (same byte count): the down GEMM writes fp32 rows
     // so the weighted reduce consumes fp32 end to end (2x output bytes vs fp16; cost in REPORT-10c)
@@ -1735,13 +1753,13 @@ void exl3_moe_prefill_wmma
     const int64_t rjobs = (int64_t) rows * (H / 128);
 #define MPW_RED2(TKV) mpw_reduce_had2_kernel<TKV><<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>> \
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh), \
-     (float*) output.data_ptr(), rows, H)
+     (float*) output.data_ptr(), rows, H, (int) experts)
     if (glue2 && top_k == 10) { MPW_RED2(10); }
     else if (glue2 && top_k == 8) { MPW_RED2(8); }
     else
     mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
-     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows);
+     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows, (int) experts);
     cuda_check(hipPeekAtLastError());
 }
 

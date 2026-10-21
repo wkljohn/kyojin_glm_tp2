@@ -22,7 +22,7 @@ zstd -dc "$PKG"/runtime/runtime-site-packages.tar.zst | tar -x -C "$SP"
 
 SRC="$PREFIX/kyojin_glm_tp2"
 mkdir -p "$SRC"
-tar -xzf "$PKG"/source/kyojin_glm_tp2-*.tar.gz -C "$SRC"
+tar -xzf "$PKG/source/kyojin_glm_tp2-$(cut -d' ' -f1 "$PKG/source/COMMIT").tar.gz" -C "$SRC"
 cp "$PKG"/source/exllamav3_ext.cpython-314-x86_64-linux-gnu.so "$SRC/"
 if [ ! -x "$SRC/.venv/bin/python" ]; then
     "$PREFIX/runtime/bin/python" -m venv --without-pip "$SRC/.venv"

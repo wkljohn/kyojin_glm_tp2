@@ -16,6 +16,37 @@ performs ordinary greedy text generation with the model's chat template.
 It checks identical rank inputs and schedules, finite logits, agreement on
 each greedy token, and deterministic results for repeated prompts.
 
+## Verified scope
+
+Two physical Radeon 8060S/gfx1151 hosts completed ordinary text inference
+over RCCL IB/RoCE v2. All 83 original shards matched the pinned model's
+upstream LFS SHA256s on both hosts. The complete model used 42 channel-sharded
+MoE layers, each retaining all 288 expert IDs and 1024 intermediate channels
+per rank. The shared expert contributed on rank 0 only.
+
+Two separate process runs passed, with both ranks exiting 0. A short run
+returned `4`, `Paris`, and `4` with an intervening request and exact reset
+agreement. The extended run used context 1024, prefill chunks of 64, and
+prompts of 328, 28, and 328 tokens. It generated 66, 96, and 66 tokens,
+with every token matching across ranks and the repeated long request matching
+exactly. Both ranks reported zero persistent expanded-weight cache.
+Loaded weights/cache occupied about 87.0 GiB on rank 0 and 85.0 GiB on rank 1.
+
+The real-weight MoE oracle also passed exact packed reconstruction of 864
+projections and numerical coverage of all 288 experts. The separate two-host
+collective adapter passed 14 precision, ownership and layout checks per rank.
+These are functional results for ordinary text generation. Attention remains
+replicated; vision, speculative decoding, production serving, longer contexts,
+and performance promotion are outside this validation.
+
+The local evidence dossier is
+`$DS4_RESEARCH_ROOT/kyojin-glm-tp2-20261021`: `CODEX-STATUS.md`,
+`RESEARCH.md`, `channel-layer3.json`, `full-generation-3.audit.json`, and
+`full-generation-extended-retry2.audit.json`. The extended run binds source
+checkpoint `a25e795`, whose source and extension hashes are recorded in
+`source-build-a25e795.json` and verified on the peer. Its expanded-cache
+counter is checked in-process after every request.
+
 ## Build and runtime
 
 Both hosts need identical source, the built `exllamav3_ext` extension, the

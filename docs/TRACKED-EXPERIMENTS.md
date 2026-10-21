@@ -1,6 +1,6 @@
 # GLM-5.3 Flash EXL3 two-host experiment
 
-Branch: `research/glm53-exl3-tp2-20261021`.
+Branch: `research/glm53-exl3-tp2-codex-20261021` (isolated channel-TP track).
 Upstream: Yamz-Labs/kyojin, `30b0e3ab91cf25b4ccb5b6d044ef4946907c6259`.
 Fork: https://github.com/wkljohn/kyojin_glm_tp2.
 

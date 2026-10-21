@@ -73,13 +73,21 @@ def run(model_path: Path, output: Path, layer: int):
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "config_sha256": hashlib.sha256((model_path / "config.json").read_bytes()).hexdigest(),
         "packed_projections_exact": checked, "rows": [], "complete": False,
+        "numerical_experts": [],
         "limits": {"relative_l2": 0.005, "max_error_over_peak": 0.02},
     }
     try:
-        for rows in (1, 2, 8, 33):
+        cases = [(rows, "boundary") for rows in (1, 2, 8, 33)] + [(36, "all_experts")]
+        covered = set()
+        for rows, routes in cases:
             torch.manual_seed(5353 + rows)
             x = torch.randn((1, rows, 4096), device="cuda", dtype=torch.float16) * 0.1
-            selected = torch.tensor([0, 1, 127, 143, 144, 255, 286, 287], device="cuda").repeat(rows, 1)
+            if routes == "all_experts":
+                selected = torch.arange(reference.num_experts, device="cuda").reshape(rows, 8)
+            else:
+                selected = torch.tensor([0, 1, 127, 143, 144, 255, 286, 287], device="cuda").repeat(rows, 1)
+            covered.update(selected.flatten().tolist())
+            report["numerical_experts"] = sorted(covered)
             weights = torch.full((rows, 8), 1 / 8, dtype=torch.float16, device="cuda")
             expected = reference.forward(x, {"dec_routed": (selected, weights)}).float().clone()
             partials = [module.forward(x, {"dec_routed": (selected, weights), "backend": backend}).float().clone()
@@ -90,12 +98,14 @@ def run(model_path: Path, output: Path, layer: int):
             error = actual - expected
             relative_l2 = (torch.linalg.vector_norm(error) / torch.linalg.vector_norm(expected).clamp_min(1e-12)).item()
             peak_error = (error.abs().max() / expected.abs().max().clamp_min(1e-12)).item()
-            report["rows"].append({"count": rows, "relative_l2": relative_l2, "max_error_over_peak": peak_error,
+            report["rows"].append({"count": rows, "routes": routes, "relative_l2": relative_l2, "max_error_over_peak": peak_error,
                                    "reference_peak": expected.abs().max().item()})
             if relative_l2 > report["limits"]["relative_l2"] or peak_error > report["limits"]["max_error_over_peak"]:
                 raise AssertionError(f"Channel sum disagrees with full real-weight MoE at {rows} rows")
         if any(backend.reductions != len(report["rows"]) for backend in backends):
             raise AssertionError("Every partial must reach exactly one parent reduction")
+        if covered != set(range(reference.num_experts)):
+            raise AssertionError("Numerical comparison must exercise every expert")
         report["complete"] = True
     finally:
         output.parent.mkdir(parents=True, exist_ok=True)

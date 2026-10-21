@@ -5,7 +5,6 @@ import torch
 
 from ..modules.block_sparse_mlp import BlockSparseMLP
 from ..modules.quant.exl3 import LinearEXL3
-from ..modules.quant.fp16 import LinearFP16
 
 
 class _CPUSlices:
@@ -44,13 +43,7 @@ def load_channel_linear(linear, device):
         inner.config = linear.config
         inner.key = linear.key
     else:
-        if not stc.has_tensor(key + ".weight") or linear.fkey is not None:
-            raise ValueError(f"{key}: rank-local loading requires unfused EXL3 or dense weights")
-        exported["weight"] = stc.get_tensor(key + ".weight", "cpu", transpose=linear.transposed_load, float2half=True, no_defer=True)
-        exported["bias"] = stc.get_tensor(key + ".bias", "cpu", optional=True, float2half=True, no_defer=True)
-        if exported["weight"].shape != (source_in, source_out):
-            raise ValueError(f"{key}: unexpected dense weight shape")
-        inner = LinearFP16.tp_import_split(context, exported, {}, linear.rank_channel_split)
+        raise ValueError(f"{key}: channel sharding requires unfused EXL3 routed weights")
     linear.inner = inner
     linear.device = torch.device(device)
     linear.quant_type = inner.quant_type
@@ -83,6 +76,11 @@ def configure_glm_channel_tp(model, backend):
             raise ValueError("Configure unloaded experts with a 256-aligned intermediate")
         if module.num_local_experts != module.num_experts or module.tp_mode is not None:
             raise ValueError("The source must contain every complete expert")
+        if module.routed_post_norm is not None or module.shared_experts_post_norm is not None:
+            raise ValueError("Channel sharding does not support expert post normalization")
+        for linear in module.gates + module.ups + module.downs:
+            if linear.fkey is not None or not linear.is_exl3_storage(linear.key):
+                raise ValueError(f"{linear.key}: channel sharding requires unfused EXL3 routed weights")
     for module in modules:
         width = module.intermediate_size // backend.world_size
         first, last = backend.rank * width, (backend.rank + 1) * width

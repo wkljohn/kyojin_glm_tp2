@@ -2166,7 +2166,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         assert self.routed_post_norm is None and self.shared_experts_post_norm is None and self.shared_gate is None, \
             f"{self.key}: post-norms / shared gate need symmetric pre-norm reductions, not supported under EP"
         perm = ep.expert_perm(self.num_experts)
-        n = self.num_experts // ep.world
+        n = ep.split(self.num_experts)[1]
         local, remote = perm[:n], perm[n:]
         drop = set(self.ups[e] for e in remote) | set(self.downs[e] for e in remote)
         if self.gated:

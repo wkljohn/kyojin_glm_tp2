@@ -349,6 +349,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           }, "hgemm");
     m.def("skinny_cat", &skinny_cat, "skinny_cat");
     m.def("skinny_cat_w", &skinny_cat_w, "skinny_cat_w");
+    m.def("q8_dequant", &q8_dequant, "q8_dequant");
+    m.def("hgemm_q8", [](at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c)
+          {
+              if (hgemm_gil_free(a)) { py::gil_scoped_release nogil; hgemm_q8(a, qw, qs, c); }
+              else hgemm_q8(a, qw, qs, c);
+          }, "hgemm_q8");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("hgemm_recon", [](at::Tensor a, at::Tensor b, at::Tensor c)
           {

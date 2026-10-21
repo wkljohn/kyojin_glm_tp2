@@ -2,6 +2,7 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ATen.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -1030,8 +1031,207 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     return true;
 }
 
+/*
+Q8 weights (KYOJIN_Q8_LINEAR): the same GEMV over an 8-bit weight, half the bytes of fp16. qw [k, n] uint8 holds
+q + 128 (q in -127..127), qs [k / Q8_G, n] fp16 the scale of each 64-row group of a column; w = (qw - 128) * s.
+Each iteration of a warp covers the 64 rows of one group (8 warps x 8 rows in flight), so a lane loads its 8 column
+scales once per group. Same fixed-order k-split as the fp16 kernel: deterministic.
+*/
+constexpr int Q8_G = 64;
+
+template <int M>
+__global__ __launch_bounds__(THREADS)
+void wide_q8_partials_kernel
+(
+    const half* __restrict__ a,       // [M, k], row stride lda
+    const uint8_t* __restrict__ qw,   // [k, n]
+    const half* __restrict__ qs,      // [k / Q8_G, n]
+    float* __restrict__ part,         // [ksplit, M, n]
+    const int k,
+    const int n,
+    const int lda,
+    const int kc                      // k rows per block, multiple of Q8_G
+)
+{
+    __shared__ half sa[M][MAX_KC];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int k0 = blockIdx.y * kc;
+    const int k1 = min(k0 + kc, k);
+    for (int idx = threadIdx.x; idx < M * kc; idx += THREADS)
+    {
+        const int i = idx / kc, kk = idx % kc;
+        sa[i][kk] = (k0 + kk < k) ? a[(size_t) i * lda + k0 + kk] : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    constexpr int V = 8;
+    constexpr int BC = 32 * V;
+    constexpr int U = Q8_G / WARPS;           // rows of a group per warp
+    const int col = blockIdx.x * BC + lane * V;
+    const bool active = col < n;
+    float acc[M][V];
+    #pragma unroll
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int v = 0; v < V; ++v) acc[i][v] = 0.0f;
+
+    if (active)
+    {
+        const uint8_t* bp = qw + col;
+        for (int g0 = k0; g0 < k1; g0 += Q8_G)
+        {
+            const uint4 sr = *((const uint4*) (qs + (size_t) (g0 / Q8_G) * n + col));
+            const half2* sh = (const half2*) &sr;
+            float s[V], o[V];
+            #pragma unroll
+            for (int q = 0; q < V / 2; ++q)
+            {
+                const float2 f = __half22float2(sh[q]);
+                s[2 * q] = f.x; s[2 * q + 1] = f.y;
+            }
+            #pragma unroll
+            for (int v = 0; v < V; ++v) o[v] = -128.0f * s[v];
+            uint2 r[U];
+            #pragma unroll
+            for (int u = 0; u < U; ++u) r[u] = *((const uint2*) (bp + (size_t) (g0 + warp + u * WARPS) * n));
+            #pragma unroll
+            for (int u = 0; u < U; ++u)
+            {
+                float w[V];
+                #pragma unroll
+                for (int v = 0; v < 4; ++v)
+                {
+                    w[v] = fmaf((float) ((r[u].x >> (8 * v)) & 0xff), s[v], o[v]);
+                    w[v + 4] = fmaf((float) ((r[u].y >> (8 * v)) & 0xff), s[v + 4], o[v + 4]);
+                }
+                const int kr = g0 + warp + u * WARPS - k0;
+                #pragma unroll
+                for (int i = 0; i < M; ++i)
+                {
+                    const float av = __half2float(sa[i][kr]);
+                    #pragma unroll
+                    for (int v = 0; v < V; ++v) acc[i][v] = fmaf(av, w[v], acc[i][v]);
+                }
+            }
+        }
+    }
+
+    __shared__ float red[WARPS][BC];
+    float* out = part + (size_t) blockIdx.y * M * n;
+    #pragma unroll
+    for (int i = 0; i < M; ++i)
+    {
+        #pragma unroll
+        for (int v = 0; v < V; ++v) red[warp][lane * V + v] = acc[i][v];
+        __syncthreads();
+        for (int c = threadIdx.x; c < BC; c += THREADS)
+        {
+            const int gc = blockIdx.x * BC + c;
+            if (gc < n)
+            {
+                float s = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPS; ++w) s += red[w][c];
+                out[(size_t) i * n + gc] = s;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void q8_dequant_kernel(const uint8_t* __restrict__ qw, const half* __restrict__ qs, half* __restrict__ out, int k, int n)
+{
+    const size_t idx = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx >= (size_t) k * n) return;
+    const int row = idx / n, col = idx % n;
+    const uint2 r = *((const uint2*) (qw + idx));
+    const uint4 sr = *((const uint4*) (qs + (size_t) (row / Q8_G) * n + col));
+    const half* sh = (const half*) &sr;
+    half o[8];
+    #pragma unroll
+    for (int v = 0; v < 4; ++v)
+    {
+        const float s0 = __half2float(sh[v]), s1 = __half2float(sh[v + 4]);
+        o[v] = __float2half(fmaf((float) ((r.x >> (8 * v)) & 0xff), s0, -128.0f * s0));
+        o[v + 4] = __float2half(fmaf((float) ((r.y >> (8 * v)) & 0xff), s1, -128.0f * s1));
+    }
+    *((uint4*) (out + idx)) = *((uint4*) o);
+}
+
+static bool try_launch_q8(const at::Tensor& a, const at::Tensor& qw, const at::Tensor& qs, at::Tensor& c, cudaStream_t stream)
+{
+    if (a.dtype() != at::kHalf || qw.dtype() != at::kByte || qs.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kFloat && c.dtype() != at::kHalf) return false;
+    const int k = a.size(-1);
+    const int m = a.numel() / k;
+    const int n = qw.size(-1);
+    if (m < 1 || m > MAX_M || n % VEC || k % Q8_G || qw.size(0) != k) return false;
+    if (((uintptr_t) qw.data_ptr()) % 16 || ((uintptr_t) qs.data_ptr()) % 16) return false;
+    if (a.stride(-1) != 1 || c.stride(-1) != 1) return false;
+    if (a.dim() > 2 && !a.is_contiguous()) return false;
+    const int lda = a.dim() == 1 ? k : (int) a.stride(-2);
+    const int ldc = c.dim() == 1 ? n : (int) c.stride(-2);
+    const int dev = a.device().index();
+    if (dev < 0 || dev >= MAX_DEVICES) return false;
+    if (!g_ws[dev])
+    {
+        cudaStreamCaptureStatus st;
+        cuda_check(cudaStreamIsCapturing(stream, &st));
+        if (st != cudaStreamCaptureStatusNone) return false;
+        cuda_check(cudaMalloc((void**) &g_ws[dev], WS_BYTES));
+    }
+    const int cblocks = (n + COLS - 1) / COLS;
+    static int tblocks = -1;
+    if (tblocks < 0) { const char* e = getenv("EXL3_WIDE_BLOCKS"); tblocks = e ? std::max(1, atoi(e)) : TARGET_BLOCKS; }
+    int ksplit = std::max(1, tblocks / cblocks);
+    int kc = (k + ksplit - 1) / ksplit;
+    kc = std::min(MAX_KC, std::max(Q8_G, ((kc + Q8_G - 1) / Q8_G) * Q8_G));
+    ksplit = (k + kc - 1) / kc;
+    if ((size_t) ksplit * m * n * sizeof(float) > WS_BYTES) return false;
+    float* part = g_ws[dev];
+    dim3 grid(cblocks, ksplit);
+    #define WQ_CASE(MM) case MM: wide_q8_partials_kernel<MM><<<grid, THREADS, 0, stream>>>( \
+        (const half*) a.data_ptr(), (const uint8_t*) qw.data_ptr(), (const half*) qs.data_ptr(), part, k, n, lda, kc); break;
+    switch (m) { WQ_CASE(1) WQ_CASE(2) WQ_CASE(3) WQ_CASE(4) WQ_CASE(5) WQ_CASE(6) WQ_CASE(7) WQ_CASE(8) default: return false; }
+    #undef WQ_CASE
+    const int rblocks = (m * n + 255) / 256;
+    if (c.dtype() == at::kFloat)
+        wide_reduce_kernel<float><<<rblocks, 256, 0, stream>>>(part, (float*) c.data_ptr(), m, n, ksplit, ldc);
+    else
+        wide_reduce_kernel<half><<<rblocks, 256, 0, stream>>>(part, (half*) c.data_ptr(), m, n, ksplit, ldc);
+    cuda_check(cudaPeekAtLastError());
+    return true;
+}
+
 } // namespace wide
 
+void q8_dequant(at::Tensor qw, at::Tensor qs, at::Tensor out)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(qw.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(qw.dtype() == at::kByte && qs.dtype() == at::kHalf && out.dtype() == at::kHalf, "q8_dequant: dtypes");
+    TORCH_CHECK(qw.is_contiguous() && qs.is_contiguous() && out.is_contiguous(), "q8_dequant: contiguous");
+    const int k = qw.size(0), n = qw.size(1);
+    TORCH_CHECK(n % 8 == 0 && k % wide::Q8_G == 0, "q8_dequant: shape");
+    const size_t threads = (size_t) k * n / 8;
+    wide::q8_dequant_kernel<<<(threads + 255) / 256, 256, 0, stream>>>((const uint8_t*) qw.data_ptr(), (const half*) qs.data_ptr(), (half*) out.data_ptr(), k, n);
+    cuda_check(cudaPeekAtLastError());
+}
+
+// y = a @ dequant(qw, qs): the Q8 GEMV at <= 8 rows, else dequantize to a transient fp16 weight and run hgemm
+void hgemm_q8_gr(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, Graph* graph)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    if (wide::try_launch_q8(a, qw, qs, c, stream)) return;
+    TORCH_CHECK(!graph, "hgemm_q8: graph capture needs the <= 8 row Q8 GEMV path");
+    at::Tensor w = at::empty({qw.size(0), qw.size(1)}, a.options().dtype(at::kHalf));
+    q8_dequant(qw, qs, w);
+    hgemm_gr(a, w, c, nullptr);
+}
+
+void hgemm_q8(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c) { hgemm_q8_gr(a, qw, qs, c, nullptr); }
 
 #endif // USE_ROCM
 

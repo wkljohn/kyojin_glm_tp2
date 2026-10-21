@@ -11,6 +11,10 @@ struct BC_LinearFP16
 {
     at::Tensor weight;
     c10::optional<at::Tensor> bias;
+    at::Tensor qweight;   // Q8 (KYOJIN_Q8_LINEAR): uint8 [k, n] and fp16 group scales; weight is then undefined
+    at::Tensor qscale;
+
+    void set_q8(at::Tensor qw, at::Tensor qs) { qweight = std::move(qw); qscale = std::move(qs); weight = at::Tensor(); }
 
     BC_LinearFP16
     (

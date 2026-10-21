@@ -46,5 +46,7 @@ source tools/strix_halo/env.sh
 
 ulimit -l unlimited 2>/dev/null || true
 echo "[ep_launch] rank $KYOJIN_EP_RANK/$KYOJIN_EP_WORLD hca $NCCL_IB_HCA gid $NCCL_IB_GID_INDEX master $MASTER_ADDR:$MASTER_PORT" >&2
+# KYOJIN_EP_WRAP (forwarded to the peer) applies only on rank KYOJIN_EP_WRAP_RANK (default 1)
+if [ -n "${KYOJIN_EP_WRAP:-}" ] && [ "${KYOJIN_EP_WRAP_RANK:-1}" = "$KYOJIN_EP_RANK" ]; then EP_WRAP="$KYOJIN_EP_WRAP"; fi
 # EP_WRAP: optional profiler prefix, e.g. "rocprofv3 --kernel-trace --output-format csv -d DIR --"
 exec ${EP_WRAP:-} "$ROOT/.venv/bin/python" "$@"

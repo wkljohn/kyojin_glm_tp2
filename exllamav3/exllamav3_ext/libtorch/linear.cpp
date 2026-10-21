@@ -10,6 +10,15 @@
 
 void BC_LinearFP16::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
 {
+#if defined(USE_ROCM)
+    if (qweight.defined())
+    {
+        hgemm_q8_gr(x, qweight, qscale, y, graph);
+        if (bias)
+            add_gr(y, bias.value(), y, graph);
+        return;
+    }
+#endif
     if (x.dtype() == y.dtype() && !graph)
         at::matmul_out(y, x, weight);
     else

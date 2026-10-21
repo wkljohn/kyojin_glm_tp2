@@ -8,6 +8,11 @@ from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
+import os
+
+
+def _ep_on() -> bool:
+    return int(os.environ.get("KYOJIN_EP_WORLD", "1") or 1) > 1
 from ..cache.recurrent_util import advance_recurrent_states
 import os
 
@@ -199,6 +204,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         """
         if params is None:
             params = {}
+        # Expert-parallel two-host runs overlap each prefill chunk's all-reduces with compute (ep.prefill_overlapped)
+        if not self.loaded_tp and _ep_on():
+            from .ep import prefill_overlapped
+            if prefill_overlapped(self, input_ids, params):
+                advance_recurrent_states(input_ids, params, self)
+                return None
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
             y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
@@ -509,6 +520,10 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+        # KYOJIN_Q8_LINEAR=1: big fp16 linears stored as 8-bit group-quantized weights (decode reads half the bytes)
+        if os.environ.get("KYOJIN_Q8_LINEAR", "0") != "0":
+            from ..modules.quant.fp16 import apply_q8_linears
+            apply_q8_linears(self)
         try:
             from ..modules import moe_fused
             moe_fused.report(self)

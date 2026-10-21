@@ -16,6 +16,9 @@ void skinny_set_onepass(int64_t on);
 #if defined(USE_ROCM)
 void skinny_cat(at::Tensor a, at::Tensor b, std::vector<at::Tensor> outs);
 void skinny_cat_w(at::Tensor a, std::vector<at::Tensor> ws, std::vector<at::Tensor> outs);
+void q8_dequant(at::Tensor qw, at::Tensor qs, at::Tensor out);
+void hgemm_q8_gr(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, Graph* graph);
+void hgemm_q8(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c);
 #endif
 #endif
 

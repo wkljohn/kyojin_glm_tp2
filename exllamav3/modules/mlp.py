@@ -987,8 +987,7 @@ def ep_slice_gated_mlp(se: "GatedMLP", ep, config = None) -> "GatedMLP | None":
     if any(config.stc.has_tensor(l.key + ".bias") for l in (se.gates[0], se.ups[0], se.downs[0])):
         return None
     I, H = se.intermediate_size, se.hidden_size
-    n = I // ep.world
-    a = ep.rank * n
+    a, n = ep.split(I, 128)
     g0, u0, d0 = se.gates[0], se.ups[0], se.downs[0]
     def col(l):
         return Linear(config = config, key = l.key, in_features = H, out_features = n,

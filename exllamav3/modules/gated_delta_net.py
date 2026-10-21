@@ -1750,7 +1750,8 @@ class GatedDeltaNet(Module):
                 params["kda_ckpt"] = ck
             # Convolution. EXL3_PF_GLUE=1 (default off, bit-exact): KDA chunk path writes q | k | v planes
             plane = (self.k_dim if os.environ.get("EXL3_PF_GLUE", "0") == "1" and self.kda
-                     and self.k_dim == self.v_dim and not save_history and seqlen >= self.num_v_heads else 0)
+                     and self.k_dim == self.v_dim and not save_history and seqlen >= self.num_v_heads
+                     and self.k_dim % 1024 == 0 else 0)   # the wide conv tile; an uneven EP head share may not fit
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv = mixed_qkv,
                 conv_state = conv_state,

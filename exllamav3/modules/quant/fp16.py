@@ -33,6 +33,8 @@ class LinearFP16:
         out_dtype: torch.dtype | None = None,
         key: str | None = None
     ):
+        self.qweight = None
+        self.qscale = None
         self.weight = weight
         self._pinned_store = None
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
@@ -89,7 +91,15 @@ class LinearFP16:
             dtype = dtype,
             device = x.device
         )
-        weight = self.weight
+        if self.qweight is not None:
+            if x.shape[0] <= 8:
+                ext.hgemm_q8(x, self.qweight, self.qscale, y)
+                if self.bias is not None:
+                    y += self.bias
+                return y.view(out_shape)
+            weight = self._dequant_prefill()    # prefill: transient fp16 weight, then the unchanged GEMM paths
+        else:
+            weight = self._weight
         pinned = self._pinned_store
         if pinned is not None:
             # Pinned-host storage (vision towers): stage the weight into a shared VRAM scratch
@@ -126,6 +136,70 @@ class LinearFP16:
 
     def get_weight_tensor(self) -> torch.Tensor:
         return self.weight
+
+    # Q8 storage (KYOJIN_Q8_LINEAR): uint8 [k, n] = q + 128 and fp16 scales [k / 64, n], w = (qweight - 128) * scale.
+    # Symmetric per 64-row group of each column (llama.cpp Q8_0 class, 8.25 bits per weight); replaces the fp16 copy
+    Q8_G = 64
+
+    @property
+    def weight(self) -> torch.Tensor:
+        if self.qweight is not None:
+            if not getattr(self, "_q8_warned", False):
+                self._q8_warned = True
+                print(f" !! {self.key}: fp16 weight read from Q8 storage (dequantized copy; slow path)", flush = True)
+            return self._dequant()
+        return self._weight
+
+    @weight.setter
+    def weight(self, w):
+        self._weight = w
+
+    def _dequant_prefill(self) -> torch.Tensor:
+        # Under the EP two-batch overlap both halves of a chunk run this layer back to back: half A dequantizes and
+        # leaves the copy for half B, which takes it (one transient matrix, never more than one per layer)
+        from ...model.ep import ep_state
+        ep = ep_state()
+        tbo = ep.tbo if ep is not None else None
+        if tbo is None:
+            return self._dequant()
+        c = getattr(self, "_deq_shared", None)
+        if c is not None and c[0] is tbo:
+            self._deq_shared = None
+            return c[1]
+        w = self._dequant()
+        self._deq_shared = (tbo, w)
+        return w
+
+    def _dequant(self) -> torch.Tensor:
+        w = torch.empty(self.qweight.shape, dtype = torch.half, device = self.qweight.device)
+        ext.q8_dequant(self.qweight, self.qscale, w)
+        return w
+
+    def q8_eligible(self, min_numel: int) -> bool:
+        w = self._weight
+        return (w is not None and w.dtype == torch.half and w.dim() == 2 and w.is_cuda and w.is_contiguous() and
+                self._pinned_store is None and w.shape[0] % self.Q8_G == 0 and w.shape[1] % 8 == 0 and
+                w.numel() >= min_numel)
+
+    @torch.inference_mode()
+    def quantize_q8(self):
+        w = self._weight
+        k, n = w.shape
+        qw = torch.empty((k, n), dtype = torch.uint8, device = w.device)
+        qs = torch.empty((k // self.Q8_G, n), dtype = torch.half, device = w.device)
+        step = 8192
+        for c0 in range(0, n, step):
+            wf = w[:, c0 : c0 + step].float().view(k // self.Q8_G, self.Q8_G, -1)
+            s = (wf.abs().amax(dim = 1) / 127.0).clamp_min(1e-8).half()
+            qs[:, c0 : c0 + step] = s
+            q = torch.round(wf / s.float().unsqueeze(1)).clamp_(-127, 127) + 128
+            qw[:, c0 : c0 + step] = q.view(k, -1).to(torch.uint8)
+        self.qweight, self.qscale = qw, qs
+        if self.bc is not None:
+            self.bc.set_q8(qw, qs)
+        self._weight = None
+
+
 
     def get_bias_tensor(self) -> torch.Tensor | None:
         return self.bias
@@ -283,3 +357,27 @@ class LinearFP16_torch:
 
     def set_weight(self, w):
         self.nn_linear.weight = nn.Parameter(w.T.half())
+
+
+def apply_q8_linears(model, min_numel: int | None = None) -> int:
+    """Store every large fp16 linear of a loaded model as Q8 (see LinearFP16.quantize_q8). KYOJIN_Q8_MIN_NUMEL
+    (default 4M weights) keeps the small projections that fused kernels read directly in fp16."""
+    if min_numel is None:
+        min_numel = int(_os.environ.get("KYOJIN_Q8_MIN_NUMEL", 4 << 20))
+    import re
+    skip = _os.environ.get("KYOJIN_Q8_SKIP")       # regex over module keys kept in fp16
+    skip = re.compile(skip) if skip else None
+    n = 0
+    saved = 0
+    for m in model:
+        inner = getattr(m, "inner", None)
+        if type(inner).__name__ != "LinearFP16" or not inner.q8_eligible(min_numel):
+            continue
+        if skip is not None and skip.search(m.key):
+            continue
+        saved += inner._weight.numel()
+        inner.quantize_q8()
+        n += 1
+    torch.cuda.empty_cache()
+    print(f" -- Q8 linears: {n} converted, {saved * (2 - 1 - 2 / 64) / 2**30:.2f} GiB freed", flush = True)
+    return n

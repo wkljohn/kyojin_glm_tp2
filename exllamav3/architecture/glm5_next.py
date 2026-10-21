@@ -140,13 +140,14 @@ class EPVocabHead(Linear):
     logits are all-gathered in rank order, so every rank returns the full row (sampling stays replicated)."""
 
     def __init__(self, ep, config, key, in_features, vocab_size, **kwargs):
-        n = vocab_size // ep.world
+        first, n = ep.split(vocab_size, 128)
         super().__init__(config = config, key = key, in_features = in_features, out_features = n,
-                         full_out_features = vocab_size, first_out_feature = ep.rank * n, **kwargs)
+                         full_out_features = vocab_size, first_out_feature = first, **kwargs)
         self.ep = ep
+        self.ep_counts = ep.split_counts(vocab_size, 128)
 
     def forward(self, x, params, out_dtype = None):
-        return self.ep.all_gather_last(super().forward(x, params, out_dtype))
+        return self.ep.all_gather_last(super().forward(x, params, out_dtype), self.ep_counts)
 
 
 class Glm5NextModel(Model):
@@ -185,9 +186,8 @@ class Glm5NextModel(Model):
             if config.layer_types[idx] == "linear_attention":
                 kda_heads, kda_range = config.linear_num_heads, None
                 if ep is not None and os.environ.get("KYOJIN_EP_KDA_SPLIT", "1") != "0":
-                    assert config.linear_num_heads % ep.world == 0
-                    kda_heads = config.linear_num_heads // ep.world
-                    kda_range = (ep.rank * kda_heads, config.linear_num_heads)
+                    first, kda_heads = ep.split(config.linear_num_heads)
+                    kda_range = (first, config.linear_num_heads)
                 attn = GatedDeltaNet(
                     config = config,
                     key = f"{key}.self_attn",
@@ -223,9 +223,8 @@ class Glm5NextModel(Model):
             else:
                 mla_heads, mla_range = config.num_q_heads, None
                 if ep is not None and os.environ.get("KYOJIN_EP_MLA_SPLIT", "1") != "0":
-                    assert config.num_q_heads % ep.world == 0
-                    mla_heads = config.num_q_heads // ep.world
-                    mla_range = (ep.rank * mla_heads, config.num_q_heads)
+                    first, mla_heads = ep.split(config.num_q_heads)
+                    mla_range = (first, config.num_q_heads)
                 attn = MLAttention(
                     config = config,
                     key = f"{key}.self_attn",
@@ -358,7 +357,7 @@ class Glm5NextModel(Model):
 
         use_vocab_split = (
             ep is not None and os.environ.get("KYOJIN_EP_HEAD_SPLIT", "1") != "0" and
-            config.vocab_size % (128 * ep.world) == 0 and not config.tie_word_embeddings
+            config.vocab_size % 128 == 0 and not config.tie_word_embeddings
         )
         head_alt_key = None
         if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):

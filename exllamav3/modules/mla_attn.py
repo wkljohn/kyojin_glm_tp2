@@ -264,8 +264,14 @@ class MLAttention(Module):
         index_kpool: int = 0,
         index_kpool_tail: bool = True,
         key_indexer: str = "indexer",
+        head_range: tuple[int, int] | None = None,
     ):
         super().__init__(config, key, None)
+        # Cross-host head shard (model/ep.py): (first_head, total_heads), num_q_heads = this rank's count. q_b and
+        # kv_b are cut to the rank's heads, o_proj to the matching input rows; the latent cache, q/kv LoRA-A and the
+        # DSA indexer stay replicated, and forward() sums the o_proj partials with the EP all-reduce
+        self.head_range = head_range
+        self.ep = None
 
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
@@ -321,6 +327,8 @@ class MLAttention(Module):
             )
             self.q_b_proj = Linear(
                 config, f"{key}.{key_q_b}", q_lora_rank, num_q_heads * self.qk_head_dim,
+                **(dict(full_out_features = head_range[1] * self.qk_head_dim,
+                        first_out_feature = head_range[0] * self.qk_head_dim) if head_range else {}),
                 qmap = qmap + ".q_a" if qmap is not None else None,
                 out_dtype = torch.half, trim_padded_out = True,
                 select_hq_bits = select_hq_bits, qbits_key = qbits_key,
@@ -343,8 +351,12 @@ class MLAttention(Module):
         self.register_submodule(self.kv_a_proj_with_mqa)
         self.register_submodule(self.kv_a_layernorm)
 
+        if head_range:
+            assert q_lora_rank is not None, "head-range shard needs the q LoRA pair"
         self.o_proj = Linear(
             config, f"{key}.{key_o}", num_q_heads * v_head_dim, hidden_size,
+            **(dict(full_in_features = head_range[1] * v_head_dim, first_in_feature = head_range[0] * v_head_dim)
+               if head_range else {}),
             qmap = qmap_o, out_dtype = out_dtype, trim_padded_out = True,
             select_hq_bits = select_hq_bits, qbits_key = qbits_key,
         )
@@ -490,6 +502,9 @@ class MLAttention(Module):
                 else:
                     wf = wf * si
             w = wf.half()
+        if self.head_range:
+            h0, hn, ht = self.head_range[0], self.num_q_heads, self.head_range[1]
+            w = w.view(ht, -1, w.shape[-1])[h0 : h0 + hn].reshape(-1, w.shape[-1])
         assert w.shape == (self.num_q_heads * (self.qk_nope_head_dim + self.v_head_dim),
                            self.kv_lora_rank), \
             f"{self.key}.{self.key_kv_b}: unexpected shape {tuple(w.shape)}"
@@ -561,6 +576,8 @@ class MLAttention(Module):
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
         if x is None:
             return None                          # EXL3_PF_SKIP: kv_only, see _attend
+        if self.ep is not None:
+            self.ep.all_reduce(x)
         # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
         # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
         if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \

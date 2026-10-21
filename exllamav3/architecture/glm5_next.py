@@ -207,12 +207,18 @@ class Glm5NextModel(Model):
                     select_hq_bits = 2,
                 )
             else:
+                mla_heads, mla_range = config.num_q_heads, None
+                if ep is not None and os.environ.get("KYOJIN_EP_MLA_SPLIT", "1") != "0":
+                    assert config.num_q_heads % ep.world == 0
+                    mla_heads = config.num_q_heads // ep.world
+                    mla_range = (ep.rank * mla_heads, config.num_q_heads)
                 attn = MLAttention(
                     config = config,
                     key = f"{key}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
-                    num_q_heads = config.num_q_heads,
+                    num_q_heads = mla_heads,
+                    head_range = mla_range,
                     kv_lora_rank = config.kv_lora_rank,
                     qk_nope_head_dim = config.qk_nope_head_dim,
                     qk_rope_head_dim = config.qk_rope_head_dim,

@@ -23,6 +23,7 @@ runs. Under EP both ranks run every case and the generated token ids are compare
 import argparse, csv, hashlib, json, os, random, sys, time
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # The GLM server's measured kernel-route defaults (tools/glm/serve.py SPEED_ENV), applied before the engine loads so the
 # EP runs use the same fast paths; every rank applies the same table. KYOJIN_NO_SPEED_ENV=1 skips it
@@ -177,6 +178,7 @@ def main():
     ap.add_argument("--label", default = "")
     ap.add_argument("--dynamic-draft", action = "store_true", help = "calibrated confidence truncation of the draft window")
     ap.add_argument("--draft-confidence", type = float, default = 0.4)
+    ap.add_argument("--ngram", default = None, help = "n-gram lookup ahead of the drafter: nmin,K,lmin[,cmin] (GLM server default 2,7,16,3)")
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
@@ -212,6 +214,11 @@ def main():
                           draft_model = draft_model, draft_cache = draft_cache,
                           num_draft_tokens = args.num_draft or None,
                           dynamic_draft_tokens = args.dynamic_draft, draft_confidence = args.draft_confidence)
+
+    ng_stats = {}
+    if args.ngram and draft_model is not None:
+        from ep_spec import install_dflash_lookup
+        install_dflash_lookup(generator, tuple(int(x) for x in args.ngram.split(",")), ng_stats)
 
     def run_case(ids):
         job = Job(input_ids = ids, max_new_tokens = args.gen_tokens, min_new_tokens = args.gen_tokens,
@@ -280,7 +287,8 @@ def main():
                        prefill_tps_mean = mean("prefill_tps"), decode_tps_mean = mean("decode_tps"),
                        prefill_tps_min = min(r["prefill_tps"] for r in rows),
                        decode_tps_min = min(r["decode_tps"] for r in rows),
-                       accept_rate_mean = mean("accept_rate"), all_ranks_agree = ok,
+                       accept_rate_mean = mean("accept_rate"), all_ranks_agree = ok, ngram = args.ngram,
+                       ngram_rounds = ng_stats.get("ng", 0), ngram_tokens = ng_stats.get("ng_tokens", 0),
                        ep_all_reduces = ep.reduces if ep else 0,
                        env = {k: v for k, v in os.environ.items() if k.startswith(("KYOJIN_", "EXL3_", "NCCL_IB_", "NCCL_NET"))},
                        time = time.strftime("%Y-%m-%dT%H:%M:%S"))

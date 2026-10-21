@@ -1,0 +1,23 @@
+# /etc/systemd/system/kyojin-ep.service: install the same unit on both hosts; /etc/kyojin-ep.env picks the rank.
+# Start/stop both hosts together (restart.sh): a rank that loses its peer exits and the pair must re-form.
+[Unit]
+Description=GLM-5.3 Flash EXL3 expert-parallel rank (kyojin_glm_tp2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_SERVICE_USER
+EnvironmentFile=/etc/kyojin-ep.env
+WorkingDirectory=/opt/kyojin-glm-tp2/kyojin_glm_tp2
+ExecStart=/bin/bash -c 'exec tools/glm/ep_launch.sh tools/glm/ep_serve.py --model "$MODEL" --draft "$DRAFT" --host "$HOST" --port "$PORT" --model-id "$MODEL_ID" -c "$CTX" $EXTRA_ARGS'
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+TimeoutStartSec=600
+TimeoutStopSec=60
+KillMode=control-group
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

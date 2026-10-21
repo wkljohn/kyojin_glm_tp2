@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 
-def run(output: Path) -> None:
+def run(output: Path, adapter_source: Path | None = None) -> None:
     rank = int(os.environ["RANK"])
     if rank not in (0, 1) or os.environ.get("WORLD_SIZE") != "2":
         raise ValueError("This check requires exactly two ranks")
@@ -46,6 +47,17 @@ def run(output: Path) -> None:
     }
     try:
         dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=60), device_id=device)
+        if adapter_source is not None:
+            spec = importlib.util.spec_from_file_location("rank_collectives_probe", adapter_source)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            backend = module.RankCollectives()
+            reduce = backend.all_reduce
+            broadcast = lambda value, src: backend.broadcast(value, src_device=src)
+            report["adapter_sha256"] = hashlib.sha256(adapter_source.read_bytes()).hexdigest()
+        else:
+            reduce = dist.all_reduce
+            broadcast = dist.broadcast
         hosts = [None, None]
         # Separate host identity from local GPU ordinal on each machine.
         dist.all_gather_object(hosts, socket.gethostname())
@@ -55,22 +67,31 @@ def run(output: Path) -> None:
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             for count in (1, 4096, 256 * 4096):
                 value = torch.full((count,), rank + 1, dtype=dtype, device=device)
-                dist.all_reduce(value)
+                reduce(value)
                 torch.testing.assert_close(value, torch.full_like(value, 3), rtol=0, atol=0)
                 report["checks"].append(f"sum:{dtype}:{count}")
         epsilon = 2.0 ** -17
         value = torch.tensor([1 + epsilon if rank == 0 else -1], dtype=torch.float32, device=device)
-        dist.all_reduce(value)
+        reduce(value)
         torch.testing.assert_close(value, torch.full_like(value, epsilon), rtol=0, atol=0)
         report["checks"].append("float32-reduction-preserves-small-difference")
         value = torch.full((4096,), rank + 7, dtype=torch.int64, device=device)
-        dist.broadcast(value, src=1)
+        broadcast(value, src=1)
         torch.testing.assert_close(value, torch.full_like(value, 8), rtol=0, atol=0)
         report["checks"].append("broadcast-global-rank-one-local-device-zero")
         value = torch.full((4096,), rank, dtype=torch.float32, device=device)
-        dist.all_reduce(value)
+        reduce(value)
         torch.testing.assert_close(value, torch.ones_like(value), rtol=0, atol=0)
         report["checks"].append("zero-contribution-participates-in-sum")
+        if adapter_source is not None:
+            value = torch.full((4096,), 17 if rank == 0 else 5, device=device)
+            reduce(value, contribution=rank != 0)
+            torch.testing.assert_close(value, torch.full_like(value, 5), rtol=0, atol=0)
+            report["checks"].append("noncontributor-input-is-cleared")
+            value = torch.full((17, 2), rank + 1, device=device)[:, 0]
+            reduce(value)
+            torch.testing.assert_close(value, torch.full_like(value, 3), rtol=0, atol=0)
+            report["checks"].append("strided-reduction-copies-back")
         torch.cuda.synchronize(device)
         report["complete"] = True
     finally:
@@ -84,4 +105,6 @@ def run(output: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    run(parser.parse_args().output)
+    parser.add_argument("--adapter-source", type=Path)
+    args = parser.parse_args()
+    run(args.output, args.adapter_source)

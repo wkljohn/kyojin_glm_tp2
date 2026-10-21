@@ -467,12 +467,17 @@ class Linear(Module):
 
     @override
     def can_defer_load(self):
+        if getattr(self, "rank_channel_split", None) is not None: return False
         if self.is_sliced: return False
         return super().can_defer_load()
 
 
     @override
     def load(self, device: torch.device, **kwargs):
+        if getattr(self, "rank_channel_split", None) is not None:
+            from ..model.glm_channel_tp import load_channel_linear
+            load_channel_linear(self, device)
+            return
         self.device = device
         keys = [self.key]
         if self.alt_key:

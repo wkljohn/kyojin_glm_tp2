@@ -357,6 +357,8 @@ class Glm5NextModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if getattr(self, "rank_collectives", None) is not None:
+            params["backend"] = self.rank_collectives
         input_ids = prepare_for_attn(input_ids, params)
         prepare_for_recurrence(input_ids, params, self)
         return input_ids

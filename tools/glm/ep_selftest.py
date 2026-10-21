@@ -10,7 +10,7 @@ ep_state = _ep.ep_state
 
 ep = ep_state()
 assert ep is not None, "set KYOJIN_EP_WORLD=2"
-for rows in (1, 4, 64, 512, 2048):
+for rows in (1, 4, 8, 64, 512, 2048):
     t = torch.full((rows, 4096), float(ep.rank + 1), device = "cuda")
     for _ in range(5): ep.all_reduce(t); t.fill_(ep.rank + 1)
     torch.cuda.synchronize()

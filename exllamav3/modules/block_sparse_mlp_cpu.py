@@ -307,6 +307,9 @@ class BlockSparseMLP_CPU:
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False
+        # Cross-host expert parallel permutes the router right after load as well
+        if int(os.environ.get("KYOJIN_EP_WORLD", 1) or 1) > 1:
+            return False
         return super().can_defer_load()
 
     def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:

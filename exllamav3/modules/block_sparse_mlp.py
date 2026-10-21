@@ -562,6 +562,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.tp_reduce = False
         self.tp_mode = None
+        self.ep = None   # cross-host expert parallel state (model/ep.py) when this layer holds an expert range
 
         self.shared_experts_post_norm = shared_experts_post_norm
         self.router_pre_norm = router_pre_norm
@@ -1153,6 +1154,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def load(self, device: torch.Device, **kwargs):
         # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
         # GPU load entirely; a split registration shrinks the module to its GPU slice first
+        self.ep_maybe_split(device)
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
         self.cpu_maybe_split_load(device, **kwargs)
@@ -1457,7 +1459,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
         cpu_partial = None
         cpu_pending = None
-        if self.cpu_split_first is not None and not params.get("autosplit_measure"):
+        if self.cpu_split_first is not None and self.ep is None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
         if self.cpu_offload:
@@ -2068,7 +2070,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             (self.shared_experts is not None and self.shared_experts_post_norm is not None and not bc_sh_exp)
         )
         if pre_norm_reduce:
-            params["backend"].all_reduce(
+            self._reduce_backend(params).all_reduce(
                 final_hidden_states,
                 self.intermediate_size > 0 and self.num_local_experts > 0
             )
@@ -2096,7 +2098,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
-                params["backend"].all_reduce(y, True)
+                self._reduce_backend(params).all_reduce(y, True)
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
@@ -2110,7 +2112,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Output reduction
         if self.tp_reduce and not pre_norm_reduce:
-            params["backend"].all_reduce(
+            self._reduce_backend(params).all_reduce(
                 final_hidden_states,
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
             )
@@ -2118,6 +2120,51 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
+
+
+    def _reduce_backend(self, params: dict):
+        return self.ep if self.ep is not None else params["backend"]
+
+
+    def ep_maybe_split(self, device):
+        """Cross-host expert parallel (model/ep.py): keep this rank's contiguous expert range, ordered first, so
+        the module looks like a head slice [0, n) of a permuted expert list. The router columns and score bias are
+        permuted to the same order after load (cpu_post_load, shared with the CPU split), so every routing pick
+        of a peer-owned expert lands at slot >= n, which the head-slice kernels and the generic path mask to exact
+        zeros. The routed partials are then summed across ranks by the tp_reduce all-reduce at the end of
+        forward(). The shared expert stays on rank 0 only."""
+        from ..model.ep import ep_state
+        ep = ep_state()
+        if (
+            ep is None or self.ep is not None or device is None or torch.device(device).type != "cuda" or
+            self.num_local_experts != self.num_experts or self.routing_first is not None or
+            self.cpu_split_first is not None or self.latent_in is not None or len(self.ups) != self.num_experts
+        ):
+            return
+        perm = ep.expert_perm(self.num_experts)
+        n = self.num_experts // ep.world
+        local, remote = perm[:n], perm[n:]
+        drop = set(self.ups[e] for e in remote) | set(self.downs[e] for e in remote)
+        if self.gated:
+            drop |= set(self.gates[e] for e in remote)
+        self._split_saved = (self.gates, self.ups, self.downs, self.modules,
+                             self.num_local_experts, self.routing_first, self.routing_last)
+        if ep.rank != 0 and self.shared_experts is not None:
+            drop.add(self.shared_experts)
+            self.shared_experts = None
+        if self.gated:
+            self.gates = [self.gates[e] for e in local]
+        self.ups = [self.ups[e] for e in local]
+        self.downs = [self.downs[e] for e in local]
+        self.modules = [m for m in self.modules if m not in drop]
+        self.num_local_experts = n
+        self.routing_first = 0
+        self.routing_last = n
+        self.cpu_split_first = n
+        self._split_perm = perm
+        self._split_dynamic = False
+        self.ep = ep
+        self.tp_reduce = True
 
 
     def dec_norm_route(self, norm, xa: torch.Tensor, r: torch.Tensor, params: dict, rows: int = 1):

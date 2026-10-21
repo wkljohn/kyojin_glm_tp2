@@ -63,6 +63,25 @@ def run(args):
         template_env.filters["tojson"] = lambda value, **kwargs: json.dumps(value, **kwargs)
         template = template_env.from_string(template_path.read_text())
         report["template_sha256"] = hashlib.sha256(template_path.read_bytes()).hexdigest()
+        requests = []
+        for prompt in args.prompt:
+            text = template.render(messages=[{"role": "user", "content": prompt}],
+                                   tools=[], add_generation_prompt=True, reasoning_effort="low")
+            if args.no_thinking:
+                text += "</think>\n"
+            ids = tokenizer.encode(text, encode_special_tokens=True)
+            if ids.shape[-1] + args.max_new_tokens > args.context:
+                raise ValueError("Prompt and requested output exceed the allocated context")
+            requests.append((prompt, ids))
+        schedule = {"tokens": [ids.tolist() for _, ids in requests], "limits": report["limits"],
+                    "config_sha256": report["config_sha256"],
+                    "template_sha256": report["template_sha256"],
+                    "extension_sha256": report["extension_sha256"]}
+        schedules = [None, None]
+        dist.all_gather_object(schedules, schedule)
+        if schedules[0] != schedules[1]:
+            raise ValueError("Rank inputs, generation limits, model config, template, or extension differ")
+        report["schedule_sha256"] = hashlib.sha256(json.dumps(schedule, sort_keys=True).encode()).hexdigest()
 
         def loaded(index, total):
             print(json.dumps({"rank": backend.rank, "loading_module": index, "total": total}), flush=True)
@@ -71,16 +90,11 @@ def run(args):
         report["allocated_weight_and_cache_bytes"] = torch.cuda.memory_allocated()
         dist.barrier()
         previous_outputs = {}
-        for prompt in args.prompt:
-            text = template.render(messages=[{"role": "user", "content": prompt}],
-                                   tools=[], add_generation_prompt=True, reasoning_effort="low")
-            if args.no_thinking:
-                text += "</think>\n"
-            ids = tokenizer.encode(text, encode_special_tokens=True)
+        for prompt, ids in requests:
             prompt_length = ids.shape[-1]
-            if prompt_length + args.max_new_tokens > args.context:
-                raise ValueError("Prompt and requested output exceed the allocated context")
-            states = None
+            # Retain ownership before prepare_inputs can allocate/modify anything,
+            # including when the first prefill/forward call raises.
+            states = [cache.get_new_state()]
             generated = []
             started = time.monotonic()
             try:

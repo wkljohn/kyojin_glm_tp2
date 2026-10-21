@@ -209,10 +209,24 @@ class DFlash2Model(DFlashModel):
         super().__init__(config, **kwargs)
         self.input_layer.input_embedding_scale = config.input_embedding_scale
 
+        # Cross-host expert parallel: the drafter runs replicated on every rank; its MLPs (most of its weight bytes)
+        # are split by intermediate channels like the target's dense layers, reduced through GatedMLP.tp_reduce
+        import os
+        from ..model.ep import ep_state
+        from ..modules.mlp import ep_slice_gated_mlp
+        ep = ep_state()
+        split_mlp = ep is not None and os.environ.get("KYOJIN_EP_DRAFT_SPLIT", "1") != "0"
+
         # Re-wrap the decoder blocks built by DFlashModel with the grouped convolutions
         for i in range(self.first_block_idx, self.first_block_idx + config.num_hidden_layers):
             blk = self.modules[i]
             idx = blk.layer_idx
+            if split_mlp:
+                sliced = ep_slice_gated_mlp(blk.mlp, ep, config)
+                if sliced is not None:
+                    blk.mlp = sliced
+                    sliced.ep = ep
+                    sliced.tp_reduce = True
             mk = lambda tag: DFlash2GroupedConv(
                 config, f"layers.{idx}.{tag}", config.hidden_size, config.conv_taps,
                 config.conv_group_size, config.block_size,

@@ -30,6 +30,9 @@ export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export NCCL_IB_ROCE_VERSION_NUM=2
 export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-2}"
 export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-2}"
+# Decode block graphs replay captured RCCL collectives between eager ones on the same communicator; RCCL deadlocks on
+# that mix unless graph mixing support is on (tools/glm/ep_graph_probe.py)
+export NCCL_GRAPH_MIXING_SUPPORT="${NCCL_GRAPH_MIXING_SUPPORT:-1}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-=$IF_DEFAULT}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$IF_DEFAULT}"
 # A collective one rank never joins aborts the process after KYOJIN_EP_NCCL_TIMEOUT (300 s) instead of hanging

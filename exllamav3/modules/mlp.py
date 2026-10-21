@@ -983,6 +983,9 @@ def ep_slice_gated_mlp(se: "GatedMLP", ep, config = None) -> "GatedMLP | None":
     if not isinstance(se, GatedMLP) or se.num_slices != 1 or not se.gates or se.intermediate_size % (128 * ep.world):
         return None
     config = config or se.config
+    # A down-projection bias would be added once per rank by the reduction: only bias-free MLPs are sharded
+    if any(config.stc.has_tensor(l.key + ".bias") for l in (se.gates[0], se.ups[0], se.downs[0])):
+        return None
     I, H = se.intermediate_size, se.hidden_size
     n = I // ep.world
     a = ep.rank * n

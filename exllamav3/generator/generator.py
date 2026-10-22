@@ -76,6 +76,16 @@ def block_table_pages(max_seq_len: int) -> int:
     return ((max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE + 15) // 16 * 16
 
 
+# Diagnostic (KYOJIN_DRAFT_TREE_DIAG=<file>): per DFlash2 round, the drafter's top-k candidates, the chosen path,
+# the accepted length and the target's token at the first rejected position (rank 0 saves at exit)
+_TREE_DIAG = None
+if os.environ.get("KYOJIN_DRAFT_TREE_DIAG"):
+    import atexit
+    _TREE_DIAG = []
+    atexit.register(lambda: os.environ.get("KYOJIN_EP_RANK", "0") == "0" and
+                    torch.save(_TREE_DIAG, os.environ["KYOJIN_DRAFT_TREE_DIAG"]))
+
+
 class Generator:
 
     @staticmethod
@@ -1180,6 +1190,7 @@ class Generator:
         }
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+            params["export_draft_cand"] = _TREE_DIAG is not None
         self._flush_dkv()
         _t0 = _pt()
         out_state = self.draft_model.forward(
@@ -1221,6 +1232,8 @@ class Generator:
             cuts = torch.where(any_below, first_below, torch.full_like(first_below, window))
             w_used = int(cuts.max().item())
             self._draft_conf_round = {"ids": ids_full, "conf": conf, "window": w_used}
+            if _TREE_DIAG is not None and "draft_cand" in params:
+                self._draft_conf_round["cand"] = tuple(t[:batch_size].cpu() for t in params["draft_cand"])
             if w_used == 0:
                 return None
             window = w_used
@@ -1758,11 +1771,17 @@ class Generator:
                 a = accepted_length - 1
                 for i in range(a):
                     cal.add_label(conf[i].item(), True)
+                if _TREE_DIAG is not None and "cand" in st and a >= conf.shape[-1]:
+                    _TREE_DIAG.append({"a": a, "w": st["window"], "tail": None, "ids": ids_full.clone(),
+                                       "cand": tuple(t[row - 1].clone() for t in st["cand"])})
                 if a < conf.shape[-1]:
                     seq = job.sequences[0]
                     n = len(seq.sequence_ids)
                     tail = seq.sequence_ids.torch_slice(n - 1, n).item()
                     cal.add_label(conf[a].item(), ids_full[a].item() == tail)
+                    if _TREE_DIAG is not None and "cand" in st:
+                        _TREE_DIAG.append({"a": a, "w": st["window"], "tail": tail, "ids": ids_full.clone(),
+                                           "cand": tuple(t[row - 1].clone() for t in st["cand"])})
             cal.decay_step()
 
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden

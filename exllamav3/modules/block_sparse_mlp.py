@@ -52,6 +52,18 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # rows); EXL3_MOE_DEDUP=0 restores the per-assignment kernel
 _MOE_DEDUP = os.environ.get("EXL3_MOE_DEDUP", "1") != "0"
 
+# Diagnostic (KYOJIN_EP_ROUTE_DUMP=<file>): decode-size routing picks per EP layer, saved by rank 0 at exit
+_ROUTE_DUMP = None
+if os.environ.get("KYOJIN_EP_ROUTE_DUMP"):
+    import atexit
+    _ROUTE_DUMP = []
+
+    def _save_route_dump():
+        if os.environ.get("KYOJIN_EP_RANK", "0") == "0":
+            torch.save(_ROUTE_DUMP, os.environ["KYOJIN_EP_ROUTE_DUMP"])
+    atexit.register(_save_route_dump)
+
+
 def _nc2_shared_fuse() -> bool:
     return os.environ.get("EXL3_NC2_SHARED_FUSE", "0") == "1"
 
@@ -2063,6 +2075,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
+
+        if _ROUTE_DUMP is not None and self.ep is not None and bsz <= 16 and not params.get("autosplit_measure"):
+            _ROUTE_DUMP.append((self.key, self.num_local_experts, selected_experts[:bsz].cpu().short()))
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)

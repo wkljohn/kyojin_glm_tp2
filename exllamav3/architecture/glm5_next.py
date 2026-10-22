@@ -223,7 +223,9 @@ class Glm5NextModel(Model):
             else:
                 mla_heads, mla_range = config.num_q_heads, None
                 if ep is not None and os.environ.get("KYOJIN_EP_MLA_SPLIT", "1") != "0":
-                    first, mla_heads = ep.split(config.num_q_heads)
+                    # KYOJIN_EP_MLA_ALIGN (default 32): head-block alignment of the split, so both ranks fit the 32-head
+                    # tiles of the fast DSA decode kernel (34/30 left rank 0 on three 16-head blocks and both off it)
+                    first, mla_heads = ep.split(config.num_q_heads, int(os.environ.get("KYOJIN_EP_MLA_ALIGN", "32")))
                     mla_range = (first, config.num_q_heads)
                 attn = MLAttention(
                     config = config,

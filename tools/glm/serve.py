@@ -61,6 +61,9 @@ SPEED_ENV = {
     "EXL3_HC_1PASS_PF": "1",
     # 26/09 gains: DSA decode attention +4.6 % at 4K; prefill chunking -7.3 % at 4K.
     "EXL3_DEC_DSA_FAST": "1",
+    # 22/10 (EP): verify rows up to 8 take the fast dt DSA kernel (bit-equal per row to the 1-row call); with the
+    # 32-aligned MLA head split it covers both EP ranks. needle 115.2 -> 112.3 ms/round, logit gate at the noise floor
+    "EXL3_DSA_DEC_DT_R": "8",
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",

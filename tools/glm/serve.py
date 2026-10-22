@@ -64,6 +64,10 @@ SPEED_ENV = {
     # 22/10 (EP): verify rows up to 8 take the fast dt DSA kernel (bit-equal per row to the 1-row call); with the
     # 32-aligned MLA head split it covers both EP ranks. needle 115.2 -> 112.3 ms/round, logit gate at the noise floor
     "EXL3_DSA_DEC_DT_R": "8",
+    # 22/10: DFlash2 draft window cut at the first position whose chosen-candidate softmax probability (over the
+    # selector's top-k) is below 0.7, instead of the calibrated raw-score threshold. Verify costs ~58 + 8 ms per draft
+    # row (ep_bench --fixed-draft); replay vs true text 30.8 -> 34.6 tok/s-equiv; bench decode mean 33.1 -> 35.0-35.1
+    "KYOJIN_DRAFT_PSEL": "0.7",
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",

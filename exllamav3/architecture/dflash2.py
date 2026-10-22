@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 
@@ -195,11 +196,15 @@ class DFlash2Selector(Module):
         rows = torch.arange(b, device = cand.device)
         p = torch.zeros(b, dtype = torch.long, device = cand.device)
         path, conf = [], []
+        # KYOJIN_DRAFT_PSEL: the per-position confidence is the softmax probability of the chosen candidate among the
+        # top-k (a sharper acceptance predictor than the raw score; replayed against true greedy text it truncates the
+        # verify window far better), compared against that fixed threshold instead of the calibrator
+        psel = os.environ.get("KYOJIN_DRAFT_PSEL")
         for step in range(L):
             s = scores[rows, step, p]                                                # (b, k)
             sel = s.argmax(dim = -1)
             path.append(cand[rows, step, sel])
-            conf.append(s[rows, sel])
+            conf.append(torch.softmax(s.float(), dim = -1)[rows, sel] if psel else s[rows, sel])
             p = sel
         return torch.stack(path, dim = 1), torch.stack(conf, dim = 1)
 

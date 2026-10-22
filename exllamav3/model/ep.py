@@ -32,6 +32,10 @@ class EPState:
         self.reduces = 0
         self.bf16_min = int(os.environ.get("KYOJIN_EP_BF16_MIN", 64 * 4096))
         self.share = float(os.environ.get("KYOJIN_EP_SHARE", "0.5"))
+        # KYOJIN_EP_SHARE_DENSE: rank 0's share of the non-expert splits (attention heads, vocab, dense/shared/drafter
+        # channels), default = KYOJIN_EP_SHARE. Prefill (compute-bound MoE) and decode (bandwidth-bound GEMVs) weigh
+        # experts and the rest differently, so two shares can balance both phases where one cannot
+        self.share_dense = float(os.environ.get("KYOJIN_EP_SHARE_DENSE", os.environ.get("KYOJIN_EP_SHARE", "0.5")))
         # Two-batch overlap of prefill chunks (prefill_overlapped): the active hand-over, and which half this thread runs
         self.tbo = None
         self._tls = threading.local()
@@ -47,14 +51,14 @@ class EPState:
             print(f" -- EP reduce prof rank {self.rank}: rows {rows:5d}  calls {n:7d}  total {t * 1e3:10.1f} ms  "
                   f"mean {t / n * 1e6:8.1f} us", flush = True)
 
-    def split(self, total: int, align: int = 1) -> tuple[int, int]:
+    def split(self, total: int, align: int = 1, share: float | None = None) -> tuple[int, int]:
         """(first, count) of this rank's share of total units (experts, heads, channels, vocab), in align-sized
         blocks. KYOJIN_EP_SHARE (two ranks; default 0.5) is rank 0's share: hosts of unequal sustained compute get
         work in proportion so neither waits at every all-reduce (heterogeneity-aware placement)."""
         assert total % align == 0
         blocks = total // align
         if self.world == 2:
-            b0 = min(blocks - 1, max(1, round(blocks * self.share)))
+            b0 = min(blocks - 1, max(1, round(blocks * (self.share_dense if share is None else share))))
             first, count = (0, b0) if self.rank == 0 else (b0, blocks - b0)
         else:
             assert blocks % self.world == 0, f"{total} not divisible into {self.world} x {align}"
@@ -63,7 +67,7 @@ class EPState:
         return first * align, count * align
 
     def expert_range(self, num_experts: int) -> tuple[int, int]:
-        first, count = self.split(num_experts)
+        first, count = self.split(num_experts, share = self.share)
         return first, first + count
 
     def expert_perm(self, num_experts: int) -> list[int]:
@@ -194,13 +198,13 @@ class EPState:
             tensor.copy_(t)
         self.reduces += 1
 
-    def split_counts(self, total: int, align: int = 1) -> list[int]:
+    def split_counts(self, total: int, align: int = 1, share: float | None = None) -> list[int]:
         """Every rank's count under split() (rank order)."""
         me = self.rank
         counts = []
         for r in range(self.world):
             self.rank = r
-            counts.append(self.split(total, align)[1])
+            counts.append(self.split(total, align, share)[1])
         self.rank = me
         return counts
 
@@ -405,7 +409,7 @@ def ep_state() -> EPState | None:
         names = ("KYOJIN_EP_SHARE", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
                  "KYOJIN_EP_BF16_MIN", "KYOJIN_EP_KDA_SPLIT", "KYOJIN_EP_MLA_SPLIT", "KYOJIN_EP_DENSE_SPLIT",
                  "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP",
-                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN")
+                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN", "KYOJIN_EP_SHARE_DENSE")
         import zlib
         cfg = torch.tensor([float(zlib.crc32(os.environ.get(k, "").encode())) for k in names],
                            dtype = torch.float64, device = device)

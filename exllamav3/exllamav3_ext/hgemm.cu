@@ -1039,7 +1039,7 @@ scales once per group. Same fixed-order k-split as the fp16 kernel: deterministi
 */
 constexpr int Q8_G = 64;
 
-template <int M>
+template <int M, bool RNG = false>
 __global__ __launch_bounds__(THREADS)
 void wide_q8_partials_kernel
 (
@@ -1050,7 +1050,9 @@ void wide_q8_partials_kernel
     const int k,
     const int n,
     const int lda,
-    const int kc                      // k rows per block, multiple of Q8_G
+    const int kc,                     // k rows per block, multiple of Q8_G
+    const int* __restrict__ rng = nullptr,  // RNG: device [lo, hi), multiples of Q8_G (and of V columns)
+    const int rmode = 0               // RNG: 0 = only output columns [lo, hi) (the others come out 0), 1 = only k rows [lo, hi)
 )
 {
     __shared__ half sa[M][MAX_KC];
@@ -1069,7 +1071,14 @@ void wide_q8_partials_kernel
     constexpr int BC = 32 * V;
     constexpr int U = Q8_G / WARPS;           // rows of a group per warp
     const int col = blockIdx.x * BC + lane * V;
-    const bool active = col < n;
+    bool active = col < n;
+    int g_lo = k0, g_hi = k1;
+    if constexpr (RNG)
+    {
+        const int lo = rng[0], hi = rng[1];
+        if (rmode == 0) active = active && col >= lo && col < hi;
+        else { g_lo = max(k0, lo); g_hi = min(k1, hi); }
+    }
     float acc[M][V];
     #pragma unroll
     for (int i = 0; i < M; ++i)
@@ -1079,7 +1088,7 @@ void wide_q8_partials_kernel
     if (active)
     {
         const uint8_t* bp = qw + col;
-        for (int g0 = k0; g0 < k1; g0 += Q8_G)
+        for (int g0 = g_lo; g0 < g_hi; g0 += Q8_G)
         {
             const uint4 sr = *((const uint4*) (qs + (size_t) (g0 / Q8_G) * n + col));
             const half2* sh = (const half2*) &sr;
@@ -1159,7 +1168,8 @@ __global__ void q8_dequant_kernel(const uint8_t* __restrict__ qw, const half* __
     *((uint4*) (out + idx)) = *((uint4*) o);
 }
 
-static bool try_launch_q8(const at::Tensor& a, const at::Tensor& qw, const at::Tensor& qs, at::Tensor& c, cudaStream_t stream)
+static bool try_launch_q8(const at::Tensor& a, const at::Tensor& qw, const at::Tensor& qs, at::Tensor& c, cudaStream_t stream,
+                          const int* rng = nullptr, int rmode = 0)
 {
     if (a.dtype() != at::kHalf || qw.dtype() != at::kByte || qs.dtype() != at::kHalf) return false;
     if (c.dtype() != at::kFloat && c.dtype() != at::kHalf) return false;
@@ -1191,8 +1201,15 @@ static bool try_launch_q8(const at::Tensor& a, const at::Tensor& qw, const at::T
     if ((size_t) ksplit * m * n * sizeof(float) > WS_BYTES) return false;
     float* part = g_ws[dev];
     dim3 grid(cblocks, ksplit);
-    #define WQ_CASE(MM) case MM: wide_q8_partials_kernel<MM><<<grid, THREADS, 0, stream>>>( \
-        (const half*) a.data_ptr(), (const uint8_t*) qw.data_ptr(), (const half*) qs.data_ptr(), part, k, n, lda, kc); break;
+    #define WQ_CASE(MM) case MM: \
+        if (rng) { \
+            wide_q8_partials_kernel<MM, true><<<grid, THREADS, 0, stream>>>( \
+            (const half*) a.data_ptr(), (const uint8_t*) qw.data_ptr(), (const half*) qs.data_ptr(), part, k, n, lda, kc, rng, rmode); \
+        } else { \
+            wide_q8_partials_kernel<MM><<<grid, THREADS, 0, stream>>>( \
+            (const half*) a.data_ptr(), (const uint8_t*) qw.data_ptr(), (const half*) qs.data_ptr(), part, k, n, lda, kc); \
+        } \
+        break;
     switch (m) { WQ_CASE(1) WQ_CASE(2) WQ_CASE(3) WQ_CASE(4) WQ_CASE(5) WQ_CASE(6) WQ_CASE(7) WQ_CASE(8) default: return false; }
     #undef WQ_CASE
     const int rblocks = (m * n + 255) / 256;
@@ -1232,6 +1249,68 @@ void hgemm_q8_gr(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, Graph
 }
 
 void hgemm_q8(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c) { hgemm_q8_gr(a, qw, qs, c, nullptr); }
+
+/*
+KYOJIN_EP_SHARED_DYN: per-MoE-call split of the (replicated) shared expert between the two EP ranks, from the routing
+both ranks already hold. sel [nsel] are router picks in this rank's slot order (own experts in [0, n_local)). Rank
+loads in expert-read units: l0 / l1 = distinct experts of rank 0 / 1, rank 1 costs w1 per unit plus a fixed offset
+b1 (units), one 128-channel shared block costs sb units. Rank 0 takes x blocks (rounded optimum of
+max(l0 + x sb, w1 (l1 + (nb - x) sb) + b1)), rank 1 the rest; this rank's channel range goes to rng = [lo, hi).
+Both ranks count the same integers, so they agree on x exactly. One block of 256 threads, n_experts <= 1024.
+*/
+__global__ void ep_shared_range_kernel(const int64_t* __restrict__ sel, int nsel, int n_local, int n_experts, int rank,
+                                       int nb, float sb, float w1, float b1, int* __restrict__ rng)
+{
+    __shared__ unsigned char seen[1024];
+    __shared__ int cnt[2];
+    for (int i = threadIdx.x; i < n_experts; i += blockDim.x) seen[i] = 0;
+    if (threadIdx.x < 2) cnt[threadIdx.x] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < nsel; i += blockDim.x)
+    {
+        const int64_t e = sel[i];
+        if (e >= 0 && e < n_experts) seen[e] = 1;
+    }
+    __syncthreads();
+    int mine = 0, other = 0;
+    for (int i = threadIdx.x; i < n_experts; i += blockDim.x)
+        if (seen[i]) { if (i < n_local) ++mine; else ++other; }
+    atomicAdd(&cnt[0], mine);
+    atomicAdd(&cnt[1], other);
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        const float l0 = (float) (rank == 0 ? cnt[0] : cnt[1]);
+        const float l1 = (float) (rank == 0 ? cnt[1] : cnt[0]);
+        const float xs = (w1 * (l1 + nb * sb) + b1 - l0) / (sb * (1.0f + w1));
+        const int x = min(nb, max(0, (int) floorf(xs + 0.5f)));
+        rng[0] = rank == 0 ? 0 : x * 128;
+        rng[1] = rank == 0 ? x * 128 : nb * 128;
+    }
+}
+
+void ep_shared_range(at::Tensor sel, int64_t n_local, int64_t n_experts, int64_t rank, int64_t nb, double sb, double w1,
+                     double b1, at::Tensor rng)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(sel.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(sel.dtype() == at::kLong && sel.is_contiguous() && n_experts <= 1024, "ep_shared_range: sel");
+    TORCH_CHECK(rng.dtype() == at::kInt && rng.numel() >= 2, "ep_shared_range: rng");
+    ep_shared_range_kernel<<<1, 256, 0, stream>>>((const int64_t*) sel.data_ptr(), (int) sel.numel(), (int) n_local,
+        (int) n_experts, (int) rank, (int) nb, (float) sb, (float) w1, (float) b1, (int*) rng.data_ptr());
+    cuda_check(cudaPeekAtLastError());
+}
+
+// KYOJIN_EP_SHARED_DYN: the <= 8 row Q8 GEMV restricted to a device-side range rng = int32 [lo, hi) (no host sync):
+// mode 0 computes only the output columns [lo, hi) (the others come out 0), mode 1 only the k rows [lo, hi)
+void hgemm_q8_range(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, at::Tensor rng, int64_t mode)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(rng.dtype() == at::kInt && rng.is_cuda() && rng.numel() >= 2, "hgemm_q8_range: rng must be int32 cuda [2]");
+    TORCH_CHECK(wide::try_launch_q8(a, qw, qs, c, stream, (const int*) rng.data_ptr(), (int) mode),
+                "hgemm_q8_range: shape not supported by the Q8 GEMV path");
+}
 
 #endif // USE_ROCM
 

@@ -8,6 +8,7 @@ from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from .ep_shared import EPSharedDyn
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
@@ -2142,7 +2143,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
         elif self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            sh_params = {**params, "moe_valu": True} if _MOE_VALU else params
+            if isinstance(self.shared_experts, EPSharedDyn):
+                sh_params = {**sh_params, "ep_shared_sel": selected_experts[:bsz]}
+            y = self.shared_experts.forward(x, sh_params)
             if pre_norm_reduce:
                 self._reduce_backend(params).all_reduce(y, True)
             if self.shared_experts_post_norm:
@@ -2208,7 +2212,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self._split_saved = (self.gates, self.ups, self.downs, self.modules,
                              self.num_local_experts, self.routing_first, self.routing_last)
         se = self.shared_experts
-        if se is not None:
+        if se is not None and os.environ.get("KYOJIN_EP_SHARED_DYN", "0") != "0":
+            # Replicated full-width shared expert, split per call between the ranks (modules/ep_shared.py)
+            self.shared_experts = EPSharedDyn(se, ep, n, self.num_experts)
+        elif se is not None:
             sliced = self._ep_slice_shared(se, ep)
             if sliced is not None:
                 # Each rank keeps its 128-aligned share of the shared expert's intermediate channels; the

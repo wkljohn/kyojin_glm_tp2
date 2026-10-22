@@ -1279,12 +1279,15 @@ class Generator:
                 print(f" -- EP draft differs from rank 0 ({self._ep_draft_diffs}/{self._ep_draft_rounds} rounds): "
                       f"ids {int((mine[:k] != buf[:k]).sum())}, max |dconf| {float((mine[k:] - buf[k:]).abs().max()):.3g}",
                       flush = True)
+        # One readback for ids, confidences and length: the caller reads them on the host anyway (truncation,
+        # calibrator, pinned draft buffer), and every separate D2H would be one more host sync per round
         n = new_ids.numel()
-        new_ids = buf[:n].view(new_ids.shape).to(new_ids.dtype)
+        hb = buf.cpu()
+        new_ids = hb[:n].view(new_ids.shape).to(new_ids.dtype)
         if conf is not None:
-            params["draft_conf"] = buf[n:n + conf.numel()].view(conf.shape).to(conf.device, conf.dtype)
+            params["draft_conf"] = hb[n:n + conf.numel()].view(conf.shape).to(conf.dtype)
         if conf_len is not None:
-            params["draft_confidence_len"] = int(buf[-1].item())
+            params["draft_confidence_len"] = int(hb[-1].item())
         return new_ids
 
 
@@ -1297,21 +1300,24 @@ class Generator:
         import torch.distributed as dist
         from ..model.ep import EPDesync
         dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        # Draft tokens live in a pinned host buffer: checksum on the host, one H2D, one reduce, one D2H
         if draft_tokens is None:
-            w, s = 0, torch.zeros((), dtype = torch.int64, device = dev)
+            w, s = 0, 0
         else:
-            d = draft_tokens.to(dev, torch.int64)
+            d = draft_tokens.to("cpu", torch.int64)
             w = int(d.shape[-1])
-            pos = torch.arange(1, d.numel() + 1, dtype = torch.int64, device = dev).view(d.shape)
-            s = (d * pos).sum()
+            pos = torch.arange(1, d.numel() + 1, dtype = torch.int64).view(d.shape)
+            s = int((d * pos).sum())
         if EP_FAULT_TEST and self._ep.rank == 1 and draft_tokens is not None:
             # KYOJIN_EP_FAULT_TEST=N: rank 1 reports a wrong width on its Nth verify (tests the fail-closed path)
             self._ep_fault_n = getattr(self, "_ep_fault_n", 0) + 1
             if self._ep_fault_n == EP_FAULT_TEST:
                 w += 1
-        t = torch.stack((torch.tensor(batch_size, device = dev), torch.tensor(w, device = dev), s)).to(torch.int64)
-        t = torch.cat((t, -t))
-        dist.all_reduce(t, op = dist.ReduceOp.MAX)
+        t = torch.tensor([batch_size, w, s, -batch_size, -w, -s], dtype = torch.int64).to(dev)
+        if self._ep.pynccl is not None:
+            self._ep.pynccl.all_reduce(t, "max")
+        else:
+            dist.all_reduce(t, op = dist.ReduceOp.MAX)
         mx, mn = t[:3].tolist(), [-v for v in t[3:].tolist()]
         if mx != mn:
             raise EPDesync(f"rank {self._ep.rank}: batch/draft width/draft checksum differ across ranks: "

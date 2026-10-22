@@ -82,8 +82,10 @@ _TREE_DIAG = None
 if os.environ.get("KYOJIN_DRAFT_TREE_DIAG"):
     import atexit
     _TREE_DIAG = []
-    atexit.register(lambda: os.environ.get("KYOJIN_EP_RANK", "0") == "0" and
-                    torch.save(_TREE_DIAG, os.environ["KYOJIN_DRAFT_TREE_DIAG"]))
+    _TREE_SEQS = {}
+    atexit.register(lambda: os.environ.get("KYOJIN_EP_RANK", "0") == "0" and torch.save(
+        {"rounds": _TREE_DIAG, "seqs": {k: v.sequence_ids.torch_slice(0, None).view(-1).tolist()
+                                        for k, v in _TREE_SEQS.items()}}, os.environ["KYOJIN_DRAFT_TREE_DIAG"]))
 
 
 class Generator:
@@ -1771,17 +1773,19 @@ class Generator:
                 a = accepted_length - 1
                 for i in range(a):
                     cal.add_label(conf[i].item(), True)
-                if _TREE_DIAG is not None and "cand" in st and a >= conf.shape[-1]:
-                    _TREE_DIAG.append({"a": a, "w": st["window"], "tail": None, "ids": ids_full.clone(),
+                if _TREE_DIAG is not None and "cand" in st:
+                    seq = job.sequences[0]
+                    _TREE_SEQS[id(seq)] = seq
+                    # Anchor index: the round appended a accepted drafts plus one target token after it
+                    _TREE_DIAG.append({"a": a, "w": st["window"], "seq": id(seq),
+                                       "anchor": len(seq.sequence_ids) - a - 2, "ids": ids_full.clone(),
                                        "cand": tuple(t[row - 1].clone() for t in st["cand"])})
                 if a < conf.shape[-1]:
                     seq = job.sequences[0]
                     n = len(seq.sequence_ids)
                     tail = seq.sequence_ids.torch_slice(n - 1, n).item()
                     cal.add_label(conf[a].item(), ids_full[a].item() == tail)
-                    if _TREE_DIAG is not None and "cand" in st:
-                        _TREE_DIAG.append({"a": a, "w": st["window"], "tail": tail, "ids": ids_full.clone(),
-                                           "cand": tuple(t[row - 1].clone() for t in st["cand"])})
+
             cal.decay_step()
 
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden

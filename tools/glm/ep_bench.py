@@ -178,6 +178,9 @@ def main():
     ap.add_argument("--label", default = "")
     ap.add_argument("--dynamic-draft", action = "store_true", help = "calibrated confidence truncation of the draft window")
     ap.add_argument("--draft-confidence", type = float, default = 0.4)
+    ap.add_argument("--fixed-draft", type = int, default = 0,
+                    help = "verify-cost probe: every round verifies this many constant junk draft tokens (all rejected), "
+                           "so ms/round is the target's verify cost, independent of acceptance and of the text")
     ap.add_argument("--ngram", default = None, help = "n-gram lookup ahead of the drafter: nmin,K,lmin[,cmin] (GLM server default 2,7,16,3)")
     args = ap.parse_args()
 
@@ -217,7 +220,17 @@ def main():
                           dynamic_draft_tokens = args.dynamic_draft, draft_confidence = args.draft_confidence)
 
     ng_stats = {}
-    if args.ngram and draft_model is not None:
+    if args.fixed_draft and draft_model is not None:
+        junk = torch.full((1, args.fixed_draft), 13, dtype = torch.long)
+        def _fixed(results, _g = generator):
+            for j in _g.active_jobs:
+                if j.is_prefill_done() and j.time_first_token is None:
+                    torch.cuda.synchronize()
+                    j.time_first_token = time.time()
+            _g._draft_conf_round = None
+            return junk
+        generator.iterate_draftmodel_dflash_gen = _fixed
+    elif args.ngram and draft_model is not None:
         from ep_spec import install_dflash_lookup
         install_dflash_lookup(generator, tuple(int(x) for x in args.ngram.split(",")), ng_stats)
 

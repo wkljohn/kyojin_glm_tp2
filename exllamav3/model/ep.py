@@ -30,7 +30,10 @@ class EPState:
         self.rank = rank
         self.world = world
         self.reduces = 0
-        self.bf16_min = int(os.environ.get("KYOJIN_EP_BF16_MIN", 64 * 4096))
+        # fp32 all-reduce payloads of at least this many elements go over the wire as bf16. Default 4096 (every decode
+        # row, 22/10): an 8-row fp32 all-reduce is wire-bound (100 us vs 64 us for 16-bit), verify probe -1.3 ms/round;
+        # prefill chunks were already bf16. 0 disables
+        self.bf16_min = int(os.environ.get("KYOJIN_EP_BF16_MIN", 4096))
         self.share = float(os.environ.get("KYOJIN_EP_SHARE", "0.5"))
         # KYOJIN_EP_SHARE_DENSE: rank 0's share of the non-expert splits (attention heads, vocab, dense/shared/drafter
         # channels), default = KYOJIN_EP_SHARE. Prefill (compute-bound MoE) and decode (bandwidth-bound GEMVs) weigh

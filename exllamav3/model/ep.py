@@ -41,6 +41,7 @@ class EPState:
         self.share_dense = float(os.environ.get("KYOJIN_EP_SHARE_DENSE", os.environ.get("KYOJIN_EP_SHARE", "0.5")))
         # Two-batch overlap of prefill chunks (prefill_overlapped): the active hand-over, and which half this thread runs
         self.tbo = None
+        self.pynccl = None  # KYOJIN_EP_PYNCCL: ep_nccl.PyNccl for the plain all-reduces (set by ep_state)
         self._tls = threading.local()
         self.tbo_min = int(os.environ.get("KYOJIN_EP_TBO_MIN", 1024))
         # KYOJIN_EP_REDUCE_PROF=1: synchronize around every all-reduce and report wall time per row count at exit
@@ -187,17 +188,18 @@ class EPState:
             tensor.zero_()
         # Large fp32 payloads (prefill chunks) go over the wire as bf16: half the bytes on a ~2 GB/s link.
         # Every rank gets the same rounded sum, so the ranks stay identical. KYOJIN_EP_BF16_MIN=0 disables
+        ar = self.pynccl.all_reduce if self.pynccl is not None else dist.all_reduce
         if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min:
             t = tensor.to(torch.bfloat16)
-            dist.all_reduce(t)
+            ar(t)
             tensor.copy_(t)
             self.reduces += 1
             return
         if tensor.is_contiguous():
-            dist.all_reduce(tensor)
+            ar(tensor)
         else:
             t = tensor.contiguous()
-            dist.all_reduce(t)
+            ar(t)
             tensor.copy_(t)
         self.reduces += 1
 
@@ -409,10 +411,10 @@ def ep_state() -> EPState | None:
         assert float(t[0]) == expect, f"EP all-reduce self-test failed: {float(t[0])} != {expect}"
         # Settings that change what each rank computes must be identical everywhere (a different share or Q8 flag
         # on one host gives wrong output without any desync): compare them once, fail before loading the model
-        names = ("KYOJIN_EP_SHARE", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
+        names = ("KYOJIN_EP_SHARE", "KYOJIN_EP_SHARE_KDA", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
                  "KYOJIN_EP_BF16_MIN", "KYOJIN_EP_KDA_SPLIT", "KYOJIN_EP_MLA_SPLIT", "KYOJIN_EP_DENSE_SPLIT",
                  "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP",
-                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN", "KYOJIN_EP_SHARE_DENSE", "KYOJIN_DRAFT_PSEL")
+                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN", "KYOJIN_EP_SHARE_DENSE", "KYOJIN_DRAFT_PSEL", "KYOJIN_EP_PYNCCL")
         import zlib
         cfg = torch.tensor([float(zlib.crc32(os.environ.get(k, "").encode())) for k in names],
                            dtype = torch.float64, device = device)
@@ -424,5 +426,11 @@ def ep_state() -> EPState | None:
             raise EPDesync(f"rank {rank}: EP settings differ across hosts: {', '.join(bad)} (set them identically)")
         torch.cuda.synchronize()
     _STATE = EPState(rank, world)
+    if os.environ.get("KYOJIN_EP_PYNCCL", "0") != "0":
+        from .ep_nccl import PyNccl
+        _STATE.pynccl = PyNccl(rank, world, torch.device("cuda", torch.cuda.current_device()))
+        t = torch.full((4096,), float(rank + 1), device = _STATE.pynccl.device)
+        _STATE.pynccl.all_reduce(t)
+        assert float(t[0]) == world * (world + 1) / 2, "EP pynccl self-test failed"
     print(f" -- EP rank {rank}/{world} ready (torch.distributed nccl)", flush = True)
     return _STATE

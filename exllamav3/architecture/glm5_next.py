@@ -186,7 +186,9 @@ class Glm5NextModel(Model):
             if config.layer_types[idx] == "linear_attention":
                 kda_heads, kda_range = config.linear_num_heads, None
                 if ep is not None and os.environ.get("KYOJIN_EP_KDA_SPLIT", "1") != "0":
-                    first, kda_heads = ep.split(config.linear_num_heads)
+                    # KYOJIN_EP_SHARE_KDA (probe): rank 0's share of the KDA heads, default KYOJIN_EP_SHARE_DENSE
+                    sk = os.environ.get("KYOJIN_EP_SHARE_KDA")
+                    first, kda_heads = ep.split(config.linear_num_heads, share = float(sk) if sk else None)
                     kda_range = (first, config.linear_num_heads)
                 attn = GatedDeltaNet(
                     config = config,

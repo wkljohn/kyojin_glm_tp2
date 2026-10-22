@@ -1792,8 +1792,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # fp32 in its epilogue = the arithmetic of the widen copy + `final_hidden_states += y` it
             # replaces; both kernels disappear. Bit-exact.
             sh_add = None
+            # Cross-host EP: each rank adds its own shared-expert slice into its routed partial before the
+            # all-reduce either way, so the epilogue add applies there too (same arithmetic)
             if (_nc2_shared_fuse() and self.shared_experts and not self.shared_gate and
-                    not self.shared_experts_post_norm and not self.tp_reduce and
+                    not self.shared_experts_post_norm and (not self.tp_reduce or self.ep is not None) and
                     self.routed_post_norm is None and self.latent_out is None):
                 sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
                 sh_params["nc2_down_half"] = True

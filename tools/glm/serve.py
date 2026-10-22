@@ -67,7 +67,7 @@ SPEED_ENV = {
     # 22/10: DFlash2 draft window cut at the first position whose chosen-candidate softmax probability (over the
     # selector's top-k) is below 0.7, instead of the calibrated raw-score threshold. Verify costs ~58 + 8 ms per draft
     # row (ep_bench --fixed-draft); replay vs true text 30.8 -> 34.6 tok/s-equiv; bench decode mean 33.1 -> 35.0-35.1
-    "KYOJIN_DRAFT_PSEL": "0.7",
+    "KYOJIN_DRAFT_PSEL": "0.6,0.8",
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",

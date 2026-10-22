@@ -1227,8 +1227,14 @@ class Generator:
         if self.draft_calibrator is not None and draft_conf is not None:
             conf = draft_conf[:batch_size, 1:].float().cpu()
             ids_full = new_ids[:batch_size, :].cpu()
+            # KYOJIN_DRAFT_PSEL = "p" or "p0,p": probability threshold of the first draft position and of the rest
             psel = os.environ.get("KYOJIN_DRAFT_PSEL")
-            thr = float(psel) if psel else self.draft_calibrator.threshold()
+            if psel:
+                pv = [float(x) for x in psel.split(",")]
+                thr = torch.full((window,), pv[-1])
+                thr[0] = pv[0]
+            else:
+                thr = self.draft_calibrator.threshold()
             below = conf[:, :window] < thr
             any_below = below.any(dim = 1)
             first_below = below.int().argmax(dim = 1)

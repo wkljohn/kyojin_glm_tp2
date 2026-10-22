@@ -157,6 +157,26 @@ class EPEngine(serve.ResidentEngine):
         torch.cuda.empty_cache()
         self.greedy_generator = self._make_generator()
 
+    @staticmethod
+    def state_fp(g) -> tuple:
+        """Host-side generator state both ranks must agree on before a step (prefix-cache hits, KV positions, page serial)."""
+        jobs = tuple((j.new_tokens, j.cached_pages, j.cached_tokens,
+                      tuple((s.kv_position, len(s.sequence_ids)) for s in j.sequences))
+                     for j in g.pending_jobs + g.active_jobs)
+        rc = g.recurrent_cache
+        return (g.pagetable.access_serial, len(g.pending_jobs), jobs,
+                None if rc is None else len(rc), len(g.tail_ckpts))
+
+    def check_state(self, g) -> None:
+        """Rank 1 answers its fingerprint over the gloo channel; both ranks exit (70) on a mismatch instead of running
+        collectives that no longer pair up (an NCCL hang until the watchdog timeout)."""
+        mine = self.state_fp(g)
+        peer = self.answer(mine if self.rank == 1 else None)
+        if peer != mine:
+            print(f"ep_serve: FAULT state desync before step: rank {self.rank} {mine} rank 1 {peer}; exiting (70)",
+                  file = sys.stderr, flush = True)
+            os._exit(70)
+
     def iterate(self, g) -> list:
         """One generator step; on EPDesync (both ranks raise it together) exit so the pair is restarted."""
         from exllamav3.model.ep import EPDesync
@@ -212,6 +232,7 @@ class EPEngine(serve.ResidentEngine):
 
         def step():
             self.send(("step", False))
+            self.check_state(g)
             batch = self.iterate(g)
             # Counted here, on the generator thread, so the digest also covers steps whose events the request never
             # read (client gone mid-step)
@@ -273,7 +294,9 @@ class EPEngine(serve.ResidentEngine):
             elif op == "step":
                 if cmd[1]:
                     g.cancel(job)
-                elif g.num_remaining_jobs():
+                    continue
+                self.check_state(g)
+                if g.num_remaining_jobs():
                     for event in self.iterate(g):
                         if event.get("token_ids") is not None:
                             toks += event["token_ids"].flatten().tolist()

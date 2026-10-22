@@ -29,6 +29,7 @@ class RecurrentCache(OrderedDict):
         super().__init__()
         self.max_size = max_size
         self.current_size = 0
+        self._ep_cap = None  # see _full
         self.model = model
         # This cache is what churns MB-scale host blocks (see util.memory.set_host_mmap_threshold
         # for why glibc strands them), so fix the allocator policy before the first stash.
@@ -124,7 +125,7 @@ class RecurrentCache(OrderedDict):
             else:
                 stashed_state = state.stash() if stashed is None else stashed
             state_size = stashed_state["checkpoint_size"]
-            while self.update_total_size() + state_size > self.max_size:
+            while self._full(state_size):
                 assert self.current_size >= 0, "Not enough space in cache for single state"
                 pt = self.pagetable
 
@@ -187,6 +188,32 @@ class RecurrentCache(OrderedDict):
         if stranded:
             self.update_total_size()
         return len(stranded)
+
+
+    def _full(self, state_size: int) -> bool:
+        """
+        Must one checkpoint go before a new one of state_size bytes fits? Under expert parallelism the ranks hold
+        different shares of the recurrent heads, so their checkpoints differ in size and a byte budget would evict at
+        different times on each rank: a later prompt then resumes from different positions and the prefills issue
+        unequal collectives (NCCL hang). There the budget is a checkpoint count both ranks agree on, from the
+        largest per-rank checkpoint size.
+        """
+        total = self.update_total_size()
+        if self._ep_cap is None:
+            from ..model.ep import ep_state
+            ep = ep_state()
+            if ep is None:
+                self._ep_cap = 0
+            else:
+                import torch, torch.distributed as dist
+                t = torch.tensor([state_size], dtype = torch.int64, device = "cuda")
+                dist.all_reduce(t, op = dist.ReduceOp.MAX)
+                self._ep_cap = max(1, self.max_size // int(t.item()))
+                print(f" -- recurrent cache (EP rank {ep.rank}): checkpoint {state_size / 2**20:.1f} MiB here, "
+                      f"{int(t.item()) / 2**20:.1f} MiB max over ranks, {self._ep_cap} checkpoints", flush = True)
+        if self._ep_cap:
+            return len({id(v) for v in OrderedDict.values(self)}) + 1 > self._ep_cap
+        return total + state_size > self.max_size
 
 
     def update_total_size(self):

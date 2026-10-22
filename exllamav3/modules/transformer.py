@@ -332,6 +332,13 @@ class TransformerBlock(Module):
             # With hyperconnections the residual is a stream stack; export the stream mean as
             # the collapsed hidden state (streams start as broadcast copies of the embedding)
             x_ = x.mean(dim = 2) if self.attn_hc else x
+            if self.attn_hc:
+                from .hyperconnections import _ep_sp
+                sp = _ep_sp(x)
+                if sp is not None:
+                    # Sequence parallel: only this rank's stream rows are current; gather the exported rows
+                    x_ = x_.contiguous()
+                    sp[0].sp_all_gather_rows(x_)
             if x_.dtype == torch.half:
                 s.append(x_.clamp_(-65504.0, 65504.0))
             else:

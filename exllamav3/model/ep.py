@@ -83,11 +83,79 @@ class EPState:
             n, t = self.prof.get(rows, (0, 0.0))
             self.prof[rows] = (n + 1, t + time.perf_counter() - t0)
             return
+        sp = self.sp_rows(tensor)
+        if sp is not None:
+            self._reduce_scatter_rows(tensor, contribution, sp)
+            return
         tbo = self.tbo
         if tbo is not None and getattr(self._tls, "half", None) is not None:
             self._all_reduce_overlapped(tensor, contribution, tbo)
             return
         self._all_reduce(tensor, contribution)
+
+    # Sequence parallelism inside a prefill chunk (KYOJIN_EP_SP): the residual streams are sharded by token rows.
+    # Each row-sized all-reduce becomes a reduce-scatter (this rank keeps its rows; same bytes on the wire), the
+    # token-local work (mHC mix / norm / apply) runs on the local rows only, and its normalized output is
+    # all-gathered before the next attention / MLP, which still see every row.
+
+    def sp_rows(self, t: torch.Tensor | None = None):
+        """(lo, hi, n) of this rank's rows when sequence parallelism is active in this thread (and t, if given,
+        has the chunk's n rows), else None."""
+        sp = getattr(self._tls, "sp", None)
+        if sp is None or t is None:
+            return sp
+        return sp if t.dim() >= 2 and t.numel() // t.shape[-1] == sp[2] else None
+
+    def _collective(self, work):
+        tbo = self.tbo
+        if tbo is not None and getattr(self._tls, "half", None) is not None:
+            tbo.switch(self._tls.half)
+        work.wait()
+
+    def sp_split(self, n: int) -> tuple[int, int, int]:
+        """This rank's rows (lo, hi) of an n-row chunk and the padded per-rank row count m (collectives move
+        world * m rows). KYOJIN_EP_SP_SHARE (default 0.5) is rank 0's share of the rows."""
+        n0 = min(n - 1, max(1, round(n * float(os.environ.get("KYOJIN_EP_SP_SHARE", "0.5")))))
+        m = max(n0, n - n0)
+        return ((0, n0) if self.rank == 0 else (n0, n)) + (m,)
+
+    def _reduce_scatter_rows(self, tensor: torch.Tensor, contribution: bool, sp):
+        lo, hi, n = sp
+        if not contribution:
+            tensor.zero_()
+        flat = tensor.view(n, -1)
+        n0 = hi if self.rank == 0 else lo
+        m = max(n0, n - n0)
+        dt = torch.bfloat16 if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min \
+            else tensor.dtype
+        if n0 == m and 2 * m == n and dt == tensor.dtype and flat.is_contiguous():
+            t = flat
+        else:
+            # Rank r's rows at [r * m, r * m + count_r): pad each share to m rows on the wire
+            t = torch.empty((2 * m, flat.shape[1]), dtype = dt, device = flat.device)
+            t[:n0].copy_(flat[:n0])
+            t[m:m + n - n0].copy_(flat[n0:])
+            if n0 < m: t[n0:m].zero_()
+            if n - n0 < m: t[m + n - n0:].zero_()
+        out = torch.empty((m, flat.shape[1]), dtype = dt, device = flat.device)
+        self._collective(dist.reduce_scatter_tensor(out, t, async_op = True))
+        flat[lo:hi].copy_(out[:hi - lo])
+        self.reduces += 1
+
+    def sp_all_gather_rows(self, t: torch.Tensor):
+        """In place: every rank's valid rows of t (n rows, this rank's [lo, hi) filled) to all ranks."""
+        lo, hi, n = self._tls.sp
+        flat = t.view(n, -1)
+        assert flat.is_contiguous()
+        n0 = hi if self.rank == 0 else lo
+        m = max(n0, n - n0)
+        src = flat[lo:hi]
+        if hi - lo < m:
+            src = torch.cat((src, src.new_zeros((m - (hi - lo), flat.shape[1]))))
+        out = torch.empty((2 * m, flat.shape[1]), dtype = flat.dtype, device = flat.device)
+        self._collective(dist.all_gather_into_tensor(out, src.contiguous(), async_op = True))
+        flat[:n0].copy_(out[:n0])
+        flat[n0:].copy_(out[m:m + n - n0])
 
     def _all_reduce_overlapped(self, tensor: torch.Tensor, contribution: bool, tbo):
         # Same arithmetic as _all_reduce, but the collective runs on RCCL's stream while the other half of the
@@ -239,8 +307,14 @@ def prefill_overlapped(model, input_ids: torch.Tensor, params: dict) -> bool:
     errors = [None, None]
     device = torch.cuda.current_device()
 
+    sp_on = os.environ.get("KYOJIN_EP_SP", "0") != "0" and ep.world == 2
+
     def run(i):
         ep._tls.half = i
+        if sp_on:
+            nh = halves[i][0].shape[1]
+            lo, hi, _ = ep.sp_split(nh)
+            ep._tls.sp = (lo, hi, nh)
         try:
             torch.cuda.set_device(device)
             with torch.inference_mode():
@@ -252,6 +326,7 @@ def prefill_overlapped(model, input_ids: torch.Tensor, params: dict) -> bool:
             errors[i] = e
         finally:
             ep._tls.half = None
+            ep._tls.sp = None
             tbo.finish(i)
 
     dbg = os.environ.get("KYOJIN_EP_TBO_DEBUG", "0") != "0"
@@ -329,7 +404,8 @@ def ep_state() -> EPState | None:
         # on one host gives wrong output without any desync): compare them once, fail before loading the model
         names = ("KYOJIN_EP_SHARE", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
                  "KYOJIN_EP_BF16_MIN", "KYOJIN_EP_KDA_SPLIT", "KYOJIN_EP_MLA_SPLIT", "KYOJIN_EP_DENSE_SPLIT",
-                 "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP")
+                 "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP",
+                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE")
         import zlib
         cfg = torch.tensor([float(zlib.crc32(os.environ.get(k, "").encode())) for k in names],
                            dtype = torch.float64, device = device)

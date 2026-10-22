@@ -197,7 +197,8 @@ def main():
     model = Model.from_config(config)
     tokenizer = Tokenizer.from_config(config)
     ctx = (args.prompt_tokens + args.gen_tokens + 1024 + 255) // 256 * 256   # caches need page multiples
-    hist = max(1, args.num_draft)
+    # Recurrent-state history covers the longest verify: drafter window or n-gram copy length
+    hist = max(1, args.num_draft, int(args.ngram.split(",")[1]) if args.ngram else 0)
     cache = Cache(model, max_num_tokens = ctx + 4096, max_history = hist, max_batch_size = 1)
     model.load(device = "cuda:0", progressbar = False)
     draft_model = draft_cache = None

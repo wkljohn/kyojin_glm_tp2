@@ -186,6 +186,22 @@ class ExpandStreams(Module):
         return module
 
 
+
+def _ep_sp(x: torch.Tensor):
+    """(ep, lo, hi, n) when cross-host sequence parallelism shards this prefill chunk's rows (model/ep.py), else
+    None. x is a (1, n, H, D) stream stack."""
+    from ..model.ep import ep_state
+    ep = ep_state()
+    if ep is None or getattr(ep._tls, "sp", None) is None or x.dim() != 4 or x.shape[0] != 1:
+        return None
+    lo, hi, n = ep._tls.sp
+    return (ep, lo, hi, n) if x.shape[1] == n else None
+
+
+def _sp_rows(t: torch.Tensor, n: int, lo: int, hi: int) -> torch.Tensor:
+    """Rows [lo, hi) of an n-row (.., n, D) tensor as (1, hi - lo, D)."""
+    return t.reshape(n, -1)[lo:hi].unsqueeze(0)
+
 class HyperConnection(Module):
     """mHC mixer for one sublayer site. Owns raw fp32 tensors {key}_fn ((2 + H) * H rows,
     H * hidden cols), {key}_base, {key}_scale. Not a standalone graph module: TransformerBlock
@@ -250,6 +266,8 @@ class HyperConnection(Module):
         raise RuntimeError("HyperConnection is not a standalone module; use mix()")
 
     def mix(self, streams: torch.Tensor, params: dict):
+        if _ep_sp(streams) is not None:
+            raise NotImplementedError("EP sequence parallelism needs the fused hc mix_norm")
         """streams (b, s, H, D) fp32 -> (post (b,s,H), comb (b,s,H,H), collapsed (b,s,D)).
         Fused ext path (2 kernel launches, see benchmarks/hc_mix/) returns collapsed as HALF
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
@@ -307,6 +325,31 @@ class HyperConnection(Module):
         """mix_norm with an optional deferred residual apply of the previous site (pf_can_defer).
         With pending, streams are updated in place either way: fused when the site pair
         qualifies, else flushed with the plain apply followed by the normal path."""
+        sp = _ep_sp(streams)
+        if sp is not None:
+            # Sequence parallel: this rank's rows only (post / comb stay local), the normed output gathered whole
+            ep, lo, hi, n = sp
+            loc = streams[:, lo:hi]
+            if pending is not None:
+                px, ya, post_a, comb_a = pending
+                assert px is streams
+                pending = (loc, _sp_rows(ya, n, lo, hi), post_a, comb_a)
+            pad = params.pop("hc_pad_ok", None)
+            try:
+                r = self._mix_norm_local(loc, params, norm, pending)
+            finally:
+                if pad is not None:
+                    params["hc_pad_ok"] = pad
+            if r is None:
+                raise NotImplementedError("EP sequence parallelism needs the fused hc mix_norm")
+            post, comb, y_loc = r
+            y = torch.empty((1, n, y_loc.shape[-1]), dtype = y_loc.dtype, device = y_loc.device)
+            y[:, lo:hi].copy_(y_loc)
+            ep.sp_all_gather_rows(y)
+            return post, comb, y
+        return self._mix_norm_local(streams, params, norm, pending)
+
+    def _mix_norm_local(self, streams: torch.Tensor, params: dict, norm, pending = None):
         if pending is not None:
             fused = self._pf_apply_mix_norm(streams, params, norm, pending)
             if fused is not None:
@@ -341,6 +384,10 @@ class HyperConnection(Module):
         px, y, post, comb = pending
         if px is not x:
             raise RuntimeError("EXL3_PF_HC_FUSE: deferred hc apply reached a different stream tensor")
+        sp = _ep_sp(x)
+        if sp is not None:
+            _, lo, hi, n = sp
+            x, y = x[:, lo:hi], _sp_rows(y, n, lo, hi).contiguous()
         b, s, H, D = x.shape
         R = b * s
         ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H) if comb is not None else None)
@@ -440,6 +487,14 @@ class HyperConnection(Module):
         updates x IN PLACE (each output column depends only on the same column of the H
         stream rows); the torch fallback allocates. Conversion must NOT run the in-place
         path: the capture and advance passes forward the SAME stored input states twice."""
+        sp = _ep_sp(x)
+        if sp is not None:
+            # Sequence parallel: y's valid rows are this rank's (reduce-scattered); update the local streams only
+            _, lo, hi, n = sp
+            loc = x[:, lo:hi]
+            r = self.apply_(loc, _sp_rows(y, n, lo, hi).contiguous(), post, comb, params)
+            assert r is loc, "EP sequence parallelism needs the in-place hc apply"
+            return x
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
         if hasattr(ext, "hc_apply") and not converting and _hc_mix_supported(x.device) \

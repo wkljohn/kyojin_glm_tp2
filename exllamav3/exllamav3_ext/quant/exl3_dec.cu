@@ -623,6 +623,23 @@ __device__ __forceinline__ float ld_coherent(const float* p)
     return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// acc + p[0] + p[stride] + ... + p[(n - 1) * stride], added in that order (bitwise equal to the one-load-at-a-time
+// loop) with up to 8 coherent loads in flight instead of one dependent load per step
+__device__ __forceinline__ float add_coherent(float acc, const float* p, size_t stride, int n)
+{
+    int b = 0;
+    for (; b + 8 <= n; b += 8)
+    {
+        float v[8];
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = ld_coherent(p + (size_t) (b + u) * stride);
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) acc += v[u];
+    }
+    for (; b < n; ++b) acc += ld_coherent(p + (size_t) b * stride);
+    return acc;
+}
+
 // ------------------------------------------------------------------------------------------------
 // Dense GEMV, up to 4 matrices sharing x (and K bits), one launch.
 
@@ -715,7 +732,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
         for (int col = tid; col < ncols; col += THREADS)
         {
             float s = 0.0f;
-            for (int b = 0; b < jobs.kbs; ++b) s += ld_coherent(scratch + job.part_base + (size_t) b * job.N + col0 + col);
+            s = add_coherent(s, scratch + job.part_base + col0 + col, (size_t) job.N, jobs.kbs);
             z[col] = s;
         }
         __syncthreads();
@@ -863,7 +880,7 @@ void moe_gu_kernel(const half* __restrict__ x, MoeArgs a, int kbs)
         const int p = col / STRIP;
         const int c = col % STRIP;
         float s = 0.0f;
-        for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+        s = add_coherent(s, part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, (size_t) a.I, kbs);
         z[col] = s;
     }
     __syncthreads();
@@ -992,7 +1009,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
             for (int i = 0; i < 4; ++i)
             {
                 float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) s * kbs + b) * a.H + col + i);
+                t = add_coherent(t, part_base + (size_t) s * kbs * a.H + col + i, (size_t) a.H, kbs);
                 v[i] = t;
             }
             fwht128(v, lane);
@@ -1008,7 +1025,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
             for (int i = 0; i < 4; ++i)
             {
                 float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) a.topk * kbs + b) * a.H + col + i);
+                t = add_coherent(t, part_base + (size_t) a.topk * kbs * a.H + col + i, (size_t) a.H, kbs);
                 v[i] = t;
             }
             fwht128(v, lane);
@@ -1171,7 +1188,7 @@ void moe_gu_kernel_r(MoeArgsR a, int kbs)
             const int p = col / STRIP;
             const int c = col % STRIP;
             float s = 0.0f;
-            for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+            s = add_coherent(s, part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, (size_t) a.I, kbs);
             z[col] = s;
         }
         __syncthreads();
@@ -1298,7 +1315,7 @@ void moe_down_kernel_r(MoeArgsR a, int kbs, int ctr_b_off)
             for (int i = 0; i < 4; ++i)
             {
                 float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + (size_t) slot * kbs * a.H + (size_t) b * a.H + col + i);
+                t = add_coherent(t, part_base + (size_t) slot * kbs * a.H + col + i, (size_t) a.H, kbs);
                 v[i] = t;
             }
             fwht128(v, lane);
@@ -1558,7 +1575,7 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
         if (e < E)
         {
             float l = 0.0f;
-            for (int b = 0; b < nkb; ++b) l += ld_coherent(scratch + (size_t) b * E + e);
+            l = add_coherent(l, scratch + e, (size_t) E, nkb);
             l = __half2float(__float2half_rn(l));
             const float sc = 1.0f / (1.0f + __expf(-l));
             score[e] = sc;
@@ -1714,45 +1731,51 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     __threadfence();
 
     // Tail: every thread reduces the cross-block partials of all rows (same b order per element),
-    // then 64-thread groups (2 waves) run the rows' top-k concurrently, group g = row g. The pick
-    // (max choice, lowest index on ties) and the weight sum order equal router_kernel's.
-    __shared__ float score[4][320];
-    __shared__ float chs[4][320];
+    // then one wave per row runs that row's top-k (wave-synchronous, no block barrier per pick). The
+    // pick (max choice, lowest index on ties) and the weight sum order equal router_kernel's.
+    __shared__ float score[8][320];
+    __shared__ float chs[8][320];
     for (int i = tid; i < NR * E; i += 256)
     {
         const int r = i / E, e = i - r * E;
-        const float* sc_r = scratch + (size_t) r * nkb * E;
+        const float* sc_r = scratch + (size_t) r * nkb * E + e;
         float l = 0.0f;
-        for (int b = 0; b < nkb; ++b) l += ld_coherent(sc_r + (size_t) b * E + e);
+        // 16 independent loads in flight, then added in b order (same sum as the one-at-a-time loop)
+        int b = 0;
+        for (; b + 16 <= nkb; b += 16)
+        {
+            float v[16];
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) v[u] = ld_coherent(sc_r + (size_t) (b + u) * E);
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) l += v[u];
+        }
+        for (; b < nkb; ++b) l += ld_coherent(sc_r + (size_t) b * E);
         l = __half2float(__float2half_rn(l));
         const float sc = 1.0f / (1.0f + __expf(-l));
         score[r][e] = sc;
         chs[r][e] = sc + (bias ? bias[e] : 0.0f);
     }
     __syncthreads();
-    __shared__ float s_val[2][8];
-    __shared__ int s_idx[2][8];
-    __shared__ int s_sel[4][64];
+    __shared__ int s_sel[8][64];
     const int lane = tid & 31;
-    const int wave = tid >> 5;
-    const int g = tid >> 6;
-    const int gl = tid & 63;
-    const bool act = g < NR;
-    float ch[5];
+    const int g = tid >> 5;
+    if (g >= NR) return;
+    float ch[10];
     #pragma unroll
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 10; ++i)
     {
-        const int e = gl + 64 * i;
-        ch[i] = (act && e < E) ? chs[g][e] : -INFINITY;
+        const int e = lane + 32 * i;
+        ch[i] = e < E ? chs[g][e] : -INFINITY;
     }
     for (int j = 0; j < topk; ++j)
     {
         float bv = -INFINITY;
         int bi = 0x7fffffff;
         #pragma unroll
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 10; ++i)
         {
-            const int e = gl + 64 * i;
+            const int e = lane + 32 * i;
             if (e < E && (ch[i] > bv || (ch[i] == bv && e < bi))) { bv = ch[i]; bi = e; }
         }
         #pragma unroll
@@ -1762,20 +1785,11 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
             const int oi = __shfl_xor(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        const int pb = j & 1;
-        if (lane == 0) { s_val[pb][wave] = bv; s_idx[pb][wave] = bi; }
-        __syncthreads();
-        float v = s_val[pb][2 * g]; int w0 = s_idx[pb][2 * g];
-        {
-            const float v1 = s_val[pb][2 * g + 1]; const int w1 = s_idx[pb][2 * g + 1];
-            if (v1 > v || (v1 == v && w1 < w0)) { v = v1; w0 = w1; }
-        }
-        if (act && gl == 0) s_sel[g][j] = w0;
+        if (lane == 0) s_sel[g][j] = bi;
         #pragma unroll
-        for (int i = 0; i < 5; ++i) if (gl + 64 * i == w0) ch[i] = -INFINITY;
+        for (int i = 0; i < 10; ++i) if (lane + 32 * i == bi) ch[i] = -INFINITY;
     }
-    __syncthreads();
-    if (act && gl == 0)
+    if (lane == 0)
     {
         float sum = 0.0f;
         for (int j = 0; j < topk; ++j) sum += score[g][s_sel[g][j]];
@@ -2366,9 +2380,8 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
             if (!last) continue;
             for (int col = tid; col < ncols; col += THREADS)
             {
-                float s = 0.0f;
-                for (int b = 0; b < jobs.kbs; ++b)
-                    s += ld_coherent(scratch + job.part_base + (size_t) row * jobs.kbs * job.N + (size_t) b * job.N + col0 + col);
+                float s = add_coherent(0.0f, scratch + job.part_base + (size_t) row * jobs.kbs * job.N + col0 + col,
+                                       (size_t) job.N, jobs.kbs);
                 z[col] = s;
             }
             __syncthreads();
@@ -2972,7 +2985,7 @@ void exl3_dec_router
     cuda_check(cudaPeekAtLastError());
 }
 
-// NR = 2..4 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
+// NR = 2..8 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
 void exl3_dec_router_rows
 (
     const at::Tensor& x,
@@ -2994,7 +3007,7 @@ void exl3_dec_router_rows
     const int E = gate.size(1);
     TORCH_CHECK(selected.dim() == 2 && selected.size(0) == NR && selected.is_contiguous(), "exl3_dec_router_rows: selected [NR, topk]");
     const int topk = selected.size(1);
-    TORCH_CHECK(NR >= 2 && NR <= 4, "exl3_dec_router_rows: NR in 2..4");
+    TORCH_CHECK(NR >= 2 && NR <= 8, "exl3_dec_router_rows: NR in 2..8");
     TORCH_CHECK(H % ROUTER_KCHUNK == 0 && E <= 320 && E % 8 == 0 && topk <= 64 && topk <= E, "exl3_dec_router_rows: unsupported shape");
     TORCH_CHECK(selected.dtype() == at::kLong && weights.dtype() == at::kHalf && weights.is_contiguous() && weights.numel() == NR * topk, "exl3_dec_router_rows: outputs");
     TORCH_CHECK(scratch.numel() >= (int64_t) NR * (H / ROUTER_KCHUNK) * E && counters.numel() > CTR_ROUTER, "exl3_dec_router_rows: workspace");
@@ -3007,9 +3020,16 @@ void exl3_dec_router_rows
     #define ROUTER_ROWS_ARGS reinterpret_cast<const half*>(x.data_ptr()), reinterpret_cast<const half*>(gate.data_ptr()), bp, \
         selected.data_ptr<int64_t>(), reinterpret_cast<half*>(weights.data_ptr()), \
         scratch.data_ptr<float>(), counters.data_ptr<int>(), H, E, topk, (float) scale
-    if (NR == 2) { router_rows_kernel<2><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
-    else if (NR == 3) { router_rows_kernel<3><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
-    else { router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    switch (NR)
+    {
+        case 2: router_rows_kernel<2><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        case 3: router_rows_kernel<3><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        case 4: router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        case 5: router_rows_kernel<5><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        case 6: router_rows_kernel<6><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        case 7: router_rows_kernel<7><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+        default: router_rows_kernel<8><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); break;
+    }
     #undef ROUTER_ROWS_ARGS
     cuda_check(cudaPeekAtLastError());
 }

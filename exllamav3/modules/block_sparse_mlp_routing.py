@@ -400,7 +400,7 @@ def routing_ds3(bsz, cfg, y, params):
 
 
 DEC_ROUTER_ROWS_MAX = 4  # loop ~23 us/row vs torch fallback ~120 us flat: loses past R~5
-ROUTER_ROWS_KERNEL_MAX = 4  # exl3_dec_router_rows takes NR in 2..4 (exl3_dec.cu)
+ROUTER_ROWS_KERNEL_MAX = 8  # exl3_dec_router_rows takes NR in 2..8 (exl3_dec.cu)
 
 
 def _router_row_chunks(bsz: int) -> list:

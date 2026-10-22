@@ -677,6 +677,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return self.hip_prefill_buffers
 
 
+    def _shared_gu_suh(self):
+        """EXL3_MPW_ROT1 (default 1): the one fp16 input transform every local expert's gate and up share, or None.
+        Checked once per load (GLM-5.3: identical in every MoE layer), so the WMMA prefill rotates each token once."""
+        c = getattr(self, "_gu_suh_cache", False)
+        if c is False:
+            c = None
+            if os.environ.get("EXL3_MPW_ROT1", "1") != "0" and self.gated and self.gates:
+                try:
+                    ref = self.gates[0].inner.suh
+                    if ref is not None and ref.dtype == torch.half and all(
+                            torch.equal(l.inner.suh, ref) for l in self.gates + self.ups):
+                        c = ref.contiguous()
+                except AttributeError:
+                    c = None
+            self._gu_suh_cache = c
+        return c
+
     def invalidate_hip_grouped_for_lora(self, target: Linear):
         if target in self.gates or target in self.ups or target in self.downs:
             self.hip_grouped_lora_blocked = True
@@ -1797,7 +1814,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 ws["gu_out"][:2 * assignments * self.intermediate_size_padded].view(2 * assignments, self.intermediate_size_padded),
                 down_out,
                 ws["offsets"], ws["inverse"][:assignments], ws["tiles"], ws["tile_count"],
-                float(self.act_limit), bool(self.wmma_mcg), sh_add,
+                float(self.act_limit), bool(self.wmma_mcg), sh_add, self._shared_gu_suh(),
             )
             final_hidden_states = output[:num_tokens].view(eshape)
 

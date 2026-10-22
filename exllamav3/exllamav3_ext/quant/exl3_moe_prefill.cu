@@ -189,6 +189,33 @@ void mpw_gather_had_kernel
     }
 }
 
+// EXL3_MPW_ROT1: when every expert of the layer shares one gate/up input transform (suh), rotate each token row
+// ONCE (out [rows, width]) instead of writing 2 x top_k rotated copies; the gate/up GEMM then reads row
+// order[slot] / top_k (a_order). Same per-element arithmetic as mpw_gather_had_kernel, so the GEMM sees the same values.
+__global__ __launch_bounds__(256)
+void mpw_rot_kernel
+(
+    const half* __restrict__ A,
+    half* __restrict__ out,
+    const half* __restrict__ suh,
+    int rows,
+    int width,
+    int lda,
+    int a_rows
+)
+{
+    const int blocks = width / 128;
+    const int64_t job = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (job >= (int64_t) rows * blocks) return;
+    const int t = threadIdx.x & 31;
+    const int blk = job % blocks;
+    const int r = job / blocks;
+    half4 v = r < a_rows ? ((const half4*) (A + (int64_t) r * lda + blk * 128))[t]
+                         : half4(__float2half2_rn(0.f), __float2half2_rn(0.f));
+    mpw_had_h(v, suh + blk * 128, nullptr, t);
+    ((half4*) (out + (int64_t) r * width + blk * 128))[t] = v;
+}
+
 // Output transform of gate and up, SiLU(g) * u, input transform of down. In place into the
 // gate half of gu (rows 0..A-1). act_limit > 0 applies the GLM-5.3-Flash clamped SwiGLU,
 // min(silu(g), L) * clamp(u, -L, L), bit-for-bit the expression exl3_dec.cu's swiglu_act()
@@ -481,7 +508,9 @@ void mpw_gemm_kernel
     int64_t c_proj_stride,
     int size_k,
     int size_n,
-    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    int a_ld,                       // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    const int64_t* __restrict__ a_order = nullptr,  // mpw2/mpw2x: A row of sorted slot s = a_order[s] / a_topk (shared
+    int a_topk = 1                                  // per-token rows, EXL3_MPW_ROT1), else slot-contiguous rows
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -814,7 +843,9 @@ void mpw2_gemm_kernel
     int64_t c_proj_stride,
     int size_k,
     int size_n,
-    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    int a_ld,                       // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    const int64_t* __restrict__ a_order = nullptr,  // mpw2/mpw2x: A row of sorted slot s = a_order[s] / a_topk (shared
+    int a_topk = 1                                  // per-token rows, EXL3_MPW_ROT1), else slot-contiguous rows
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -837,6 +868,7 @@ void mpw2_gemm_kernel
     const int rows = (int) min((int64_t) MT, expert_offsets[expert + 1] - row0);
     const int proj = blockIdx.z;
     const uint32_t* B32 = (const uint32_t*) (proj ? B_table_1 : B_table_0)[expert];
+    const half* A_tok = A + proj * a_proj_stride;   // per-token rows (a_order)
     A += proj * a_proj_stride + row0 * a_ld;
 
     const int n0 = blockIdx.x * NT;
@@ -855,6 +887,14 @@ void mpw2_gemm_kernel
     const int a_r = t >> 2;                         // + i * (THREADS / 4)
     const int a_c = t & 3;                          // 16-byte chunk (8 k)
     const half* a_src = A + (int64_t) a_r * a_ld + a_c * 8;
+    const half* a_row[ALOADS];
+    #pragma unroll
+    for (int i = 0; i < ALOADS; ++i)
+    {
+        const int rr = min(a_r + i * (THREADS / 4), max(rows - 1, 0));
+        a_row[i] = a_order ? A_tok + (a_order[row0 + rr] / a_topk) * (int64_t) a_ld + a_c * 8
+                           : a_src + (int64_t) i * (THREADS / 4) * a_ld;
+    }
     // Tail block (size_n not a multiple of NT): waves past the last n-tile read the last valid NW tiles
     // (duplicate, never stored: the epilogue skips them), so no trellis read leaves the tensor.
     const int ntile_n = size_n / 16;
@@ -871,7 +911,7 @@ void mpw2_gemm_kernel
         #pragma unroll
         for (int i = 0; i < ALOADS; ++i)
             r[i] = a_r + i * (THREADS / 4) < rows
-                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * a_ld + k0))
+                ? *((const uint4*) (a_row[i] + k0))
                 : make_uint4(0, 0, 0, 0);
     };
     auto load_w = [&] (int it, uint32_t* r)
@@ -1082,7 +1122,9 @@ void mpw2x_gemm_kernel
     int64_t c_proj_stride,
     int size_k,
     int size_n,
-    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    int a_ld,                       // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
+    const int64_t* __restrict__ a_order = nullptr,  // mpw2/mpw2x: A row of sorted slot s = a_order[s] / a_topk (shared
+    int a_topk = 1                                  // per-token rows, EXL3_MPW_ROT1), else slot-contiguous rows
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -1105,6 +1147,7 @@ void mpw2x_gemm_kernel
     const int rows = (int) min((int64_t) MT, expert_offsets[expert + 1] - row0);
     const int proj = blockIdx.z;
     const uint32_t* B32 = (const uint32_t*) (proj ? B_table_1 : B_table_0)[expert];
+    const half* A_tok = A + proj * a_proj_stride;   // per-token rows (a_order)
     A += proj * a_proj_stride + row0 * a_ld;
 
     const int n0 = blockIdx.x * NT;
@@ -1123,6 +1166,14 @@ void mpw2x_gemm_kernel
     const int a_r = t >> 2;                         // + i * (THREADS / 4)
     const int a_c = t & 3;                          // 16-byte chunk (8 k)
     const half* a_src = A + (int64_t) a_r * a_ld + a_c * 8;
+    const half* a_row[ALOADS];
+    #pragma unroll
+    for (int i = 0; i < ALOADS; ++i)
+    {
+        const int rr = min(a_r + i * (THREADS / 4), max(rows - 1, 0));
+        a_row[i] = a_order ? A_tok + (a_order[row0 + rr] / a_topk) * (int64_t) a_ld + a_c * 8
+                           : a_src + (int64_t) i * (THREADS / 4) * a_ld;
+    }
     const int ntile_n = size_n / 16;                // tail block: clamp like mpw2_gemm_kernel (duplicate, never stored)
     const int first_tile = min(n0 / 16 + warp * NW, ntile_n - NW);
     const uint32_t* w_src = B32 + (size_t) first_tile * TWORDS;   // NW adjacent tiles: contiguous
@@ -1137,7 +1188,7 @@ void mpw2x_gemm_kernel
         #pragma unroll
         for (int i = 0; i < ALOADS; ++i)
             r[i] = a_r + i * (THREADS / 4) < rows
-                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * a_ld + k0))
+                ? *((const uint4*) (a_row[i] + k0))
                 : make_uint4(0, 0, 0, 0);
     };
     auto load_w = [&] (int it, uint32_t* r)
@@ -1413,12 +1464,13 @@ void launch_gemm_cb
     float K, dim3 grid, hipStream_t stream,
     const half* A, int64_t a_proj_stride, const int64_t* offsets, const int* tiles,
     const int* num_tiles, const int64_t* t0, const int64_t* t1, void* C, int64_t c_proj_stride,
-    int size_k, int size_n, int kern, int a_ld
+    int size_k, int size_n, int kern, int a_ld, const int64_t* a_order = nullptr, int a_topk = 1
 )
 {
     TORCH_CHECK(a_ld >= size_k && (a_ld * 2) % 16 == 0, "exl3_moe_prefill_wmma: A pitch must be >= K and 16-byte aligned");
+    TORCH_CHECK(!a_order || kern == 2, "exl3_moe_prefill_wmma: per-token A rows need the mpw2 kernel");
     TORCH_CHECK(a_ld == size_k || kern == 2, "exl3_moe_prefill_wmma: padded A pitch needs the mpw2 kernel");
-    #define MPW_ARGS A, a_proj_stride, offsets, tiles, num_tiles, t0, t1, C, c_proj_stride, size_k, size_n, a_ld
+    #define MPW_ARGS A, a_proj_stride, offsets, tiles, num_tiles, t0, t1, C, c_proj_stride, size_k, size_n, a_ld, a_order, a_topk
     const char* ldm_env = getenv("MPW_LDM");   // read per launch: A/B harnesses flip it in-process
     const int ldm = ldm_env ? atoi(ldm_env) : 1;   // LDM=1 default: +3.4% e2e prefill@4K (HANDOFF step 2)
     const int k2 = (int) (K * 2.0f + 0.5f);
@@ -1599,16 +1651,16 @@ void launch_gemm
     float K, dim3 grid, hipStream_t stream,
     const half* A, int64_t a_proj_stride, const int64_t* offsets, const int* tiles,
     const int* num_tiles, const int64_t* t0, const int64_t* t1, void* C, int64_t c_proj_stride,
-    int size_k, int size_n, bool mcg, int kern, int a_ld = 0
+    int size_k, int size_n, bool mcg, int kern, int a_ld = 0, const int64_t* a_order = nullptr, int a_topk = 1
 )
 {
     if (a_ld == 0) a_ld = size_k;
     if (mcg)
         launch_gemm_cb<OUT_FP32, 1>(K, grid, stream, A, a_proj_stride, offsets, tiles, num_tiles,
-                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld);
+                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld, a_order, a_topk);
     else
         launch_gemm_cb<OUT_FP32, 2>(K, grid, stream, A, a_proj_stride, offsets, tiles, num_tiles,
-                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld);
+                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld, a_order, a_topk);
 }
 
 inline int tile_slots(int assignments, int experts, int kern)
@@ -1652,7 +1704,8 @@ void exl3_moe_prefill_wmma
     at::Tensor& tile_count,
     double act_limit,
     bool mcg,
-    const c10::optional<at::Tensor>& addend
+    const c10::optional<at::Tensor>& addend,
+    const c10::optional<at::Tensor>& shared_suh
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -1720,7 +1773,16 @@ void exl3_moe_prefill_wmma
 
     const char* glue_env = getenv("EXL3_MPW_GLUE");   // read per launch (A/B harnesses flip it in-process)
     const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX && !add_ptr;
-    if (glue2)
+    const bool rot1 = shared_suh.has_value() && shared_suh->defined() && kern == 2;
+    if (rot1)
+    {
+        TORCH_CHECK(shared_suh->dtype() == at::kHalf && shared_suh->is_contiguous() && shared_suh->numel() == H,
+                    "exl3_moe_prefill_wmma: shared_suh must be fp16 [H]");
+        const int64_t rjobs1 = (int64_t) rows * (H / 128);
+        mpw_rot_kernel<<<CEIL_DIVIDE(rjobs1, 8), 256, 0, stream>>>
+        ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), (const half*) shared_suh->data_ptr(), rows, H, lda, a_rows);
+    }
+    else if (glue2)
     {
         const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
         mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
@@ -1736,8 +1798,9 @@ void exl3_moe_prefill_wmma
     }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,
-        (const half*) gu_had.data_ptr(), (int64_t) assignments * H, offs, tl, tc,
-        P(gate_trellis), P(up_trellis), gu_out.data_ptr(), (int64_t) assignments * I, H, I, mcg, kern);
+        (const half*) gu_had.data_ptr(), rot1 ? 0 : (int64_t) assignments * H, offs, tl, tc,
+        P(gate_trellis), P(up_trellis), gu_out.data_ptr(), (int64_t) assignments * I, H, I, mcg, kern,
+        0, rot1 ? ord : nullptr, top_k);
 
     const int64_t ajobs = (int64_t) assignments * (I / 128);
     mpw_act_kernel<<<CEIL_DIVIDE(ajobs, 8), 256, 0, stream>>>

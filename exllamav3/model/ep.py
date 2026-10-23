@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 
 _STATE = None
+# KYOJIN_EP_RET_BF16 (default 1): prefill all-reduces may hand their bf16 wire result to an exact widening consumer
+_EP_RET_BF16 = os.environ.get("KYOJIN_EP_RET_BF16", "1") != "0"
 
 
 class EPDesync(RuntimeError):
@@ -80,7 +82,10 @@ class EPState:
         return list(range(first, last)) + [e for e in range(num_experts) if not first <= e < last]
 
     # Same signature as the TP backends' all_reduce (contribution=False: this rank adds zeros)
-    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True, ret_bf16: bool = False):
+        """In place over the ranks; returns the result tensor. ret_bf16 (prefill-size payloads only): when the sum
+        went over the bf16 wire, return that bf16 tensor instead of copying it back (the caller widens it exactly)"""
+        ret_bf16 = ret_bf16 and tensor.numel() >= 256 * tensor.shape[-1] and _EP_RET_BF16
         if self.prof is not None:
             import time
             torch.cuda.synchronize()
@@ -90,16 +95,15 @@ class EPState:
             rows = tensor.numel() // tensor.shape[-1]
             n, t = self.prof.get(rows, (0, 0.0))
             self.prof[rows] = (n + 1, t + time.perf_counter() - t0)
-            return
+            return tensor
         sp = self.sp_rows(tensor)
         if sp is not None:
             self._reduce_scatter_rows(tensor, contribution, sp)
-            return
+            return tensor
         tbo = self.tbo
         if tbo is not None and getattr(self._tls, "half", None) is not None:
-            self._all_reduce_overlapped(tensor, contribution, tbo)
-            return
-        self._all_reduce(tensor, contribution)
+            return self._all_reduce_overlapped(tensor, contribution, tbo, ret_bf16)
+        return self._all_reduce(tensor, contribution, ret_bf16)
 
     # Sequence parallelism inside a prefill chunk (KYOJIN_EP_SP): the residual streams are sharded by token rows.
     # Each row-sized all-reduce becomes a reduce-scatter (this rank keeps its rows; same bytes on the wire), the
@@ -165,7 +169,7 @@ class EPState:
         flat[:n0].copy_(out[:n0])
         flat[n0:].copy_(out[m:m + n - n0])
 
-    def _all_reduce_overlapped(self, tensor: torch.Tensor, contribution: bool, tbo):
+    def _all_reduce_overlapped(self, tensor: torch.Tensor, contribution: bool, tbo, ret_bf16: bool = False):
         # Same arithmetic as _all_reduce, but the collective runs on RCCL's stream while the other half of the
         # prefill chunk computes: enqueue, hand over, then make the compute stream wait for the result
         if not contribution:
@@ -181,11 +185,14 @@ class EPState:
         work = dist.all_reduce(t, async_op = True)
         tbo.switch(self._tls.half)
         work.wait()
+        self.reduces += 1
+        if ret_bf16 and t.dtype == torch.bfloat16 and t is not tensor:
+            return t    # caller consumes the bf16 sum directly (widening it exactly in its next kernel)
         if t is not tensor:
             tensor.copy_(t)
-        self.reduces += 1
+        return tensor
 
-    def _all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+    def _all_reduce(self, tensor: torch.Tensor, contribution: bool = True, ret_bf16: bool = False):
         if not contribution:
             tensor.zero_()
         # Large fp32 payloads (prefill chunks) go over the wire as bf16: half the bytes on a ~2 GB/s link.
@@ -197,9 +204,11 @@ class EPState:
         if self.bf16_min and tensor.dtype in (torch.float, torch.half) and tensor.numel() >= self.bf16_min:
             t = tensor.to(torch.bfloat16)
             ar(t)
-            tensor.copy_(t)
             self.reduces += 1
-            return
+            if ret_bf16:
+                return t
+            tensor.copy_(t)
+            return tensor
         if tensor.is_contiguous():
             ar(tensor)
         else:
@@ -207,6 +216,7 @@ class EPState:
             ar(t)
             tensor.copy_(t)
         self.reduces += 1
+        return tensor
 
     def split_counts(self, total: int, align: int = 1, share: float | None = None) -> list[int]:
         """Every rank's count under split() (rank order)."""
@@ -419,7 +429,7 @@ def ep_state() -> EPState | None:
         names = ("KYOJIN_EP_SHARE", "KYOJIN_EP_SHARE_KDA", "KYOJIN_Q8_LINEAR", "KYOJIN_Q8_MIN_NUMEL", "KYOJIN_EP_TBO", "KYOJIN_EP_TBO_MIN",
                  "KYOJIN_EP_BF16_MIN", "KYOJIN_EP_KDA_SPLIT", "KYOJIN_EP_MLA_SPLIT", "KYOJIN_EP_DENSE_SPLIT",
                  "KYOJIN_EP_SHARED_SPLIT", "KYOJIN_EP_HEAD_SPLIT", "KYOJIN_EP_DRAFT_SPLIT", "KYOJIN_Q8_SKIP",
-                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN", "KYOJIN_EP_SHARE_DENSE", "KYOJIN_DRAFT_PSEL", "KYOJIN_EP_PYNCCL", "KYOJIN_EP_SHARED_DYN", "KYOJIN_EP_SHDYN", "KYOJIN_EP_SHARE_MLA", "KYOJIN_EP_MLA_PF_SHARE", "KYOJIN_EP_SHARED_PF_SHARE", "KYOJIN_EP_MLA_PF_ALIGN", "KYOJIN_EP_PYNCCL_SIMPLE_MIN", "KYOJIN_EP_BLOCK_GRAPH")
+                 "KYOJIN_EP_SP", "KYOJIN_EP_SP_SHARE", "KYOJIN_EP_MLA_ALIGN", "KYOJIN_EP_SHARE_DENSE", "KYOJIN_DRAFT_PSEL", "KYOJIN_EP_PYNCCL", "KYOJIN_EP_SHARED_DYN", "KYOJIN_EP_SHDYN", "KYOJIN_EP_SHARE_MLA", "KYOJIN_EP_MLA_PF_SHARE", "KYOJIN_EP_SHARED_PF_SHARE", "KYOJIN_EP_MLA_PF_ALIGN", "KYOJIN_EP_PYNCCL_SIMPLE_MIN", "KYOJIN_EP_BLOCK_GRAPH", "KYOJIN_EP_RET_BF16")
         import zlib
         cfg = torch.tensor([float(zlib.crc32(os.environ.get(k, "").encode())) for k in names],
                            dtype = torch.float64, device = device)

@@ -204,11 +204,23 @@ class TransformerBlock(Module):
                 and not self.ablit
             if plain_add:
                 params["mlp_residual_out"] = x
-            y = self.mlp.forward(y, params)
+            # EP prefill: the MoE may return its bf16 wire sum when its consumer widens it exactly (ablit project_widen
+            # yields the fp32 result project() would; the hc residual apply reads bf16)
+            mlp_bf16 = bool(self.mlp_hc) and self.mlp_resid_scalar is None and not self.mlp_post_norm
+            if mlp_bf16:
+                params["ep_mlp_bf16_ok"] = True
+            try:
+                y = self.mlp.forward(y, params)
+            finally:
+                if mlp_bf16:
+                    params.pop("ep_mlp_bf16_ok", None)
             if plain_add:
                 params.pop("mlp_residual_out", None)
-            if self.ablit:
-                ablit_runtime.project(y, self.ablit[1], *self.ablit[2:])
+            if self.ablit and self.ablit[1] != 0.0:
+                if y.dtype == torch.bfloat16:
+                    y = ablit_runtime.project_widen(y, self.ablit[1], *self.ablit[2:])
+                else:
+                    ablit_runtime.project(y, self.ablit[1], *self.ablit[2:])
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
@@ -287,13 +299,20 @@ class TransformerBlock(Module):
             pfe_half = bool(self.attn_hc) and self.attn_resid_scalar is None \
                 and not export_state and "pfe_y_half" not in params and \
                 (not self.ablit or os.environ.get("EXL3_NC2_ABLIT_F16", "0") == "1")
+            # EP: the bf16 wire sum may reach its consumer directly when that consumer widens it exactly: an ablit
+            # block's project_widen, or the hc residual apply (no residual scalar in between)
+            pfe_bf16 = pfe_half and self.attn_resid_scalar is None and (
+                (bool(self.ablit) and self.ablit[0] != 0.0) or not self.ablit)
             if pfe_half:
                 params["pfe_y_half"] = True
+                if pfe_bf16:
+                    params["pfe_y_bf16_ok"] = True
             try:
                 y = self.attn.forward(y, params)
             finally:
                 if pfe_half:
                     params.pop("pfe_y_half", None)
+                    params.pop("pfe_y_bf16_ok", None)
             if y is None:
                 # EXL3_PF_SKIP: kv_only -- attention wrote its K/V (and indexer) rows and the
                 # caller discards this block's output, so nothing below has an input to read
@@ -301,7 +320,7 @@ class TransformerBlock(Module):
             if params.get("prefill") and not export_state:
                 return x
             if self.ablit:
-                if pfe_half and y.dtype == torch.half and self.ablit[0] != 0.0:
+                if pfe_half and y.dtype in (torch.half, torch.bfloat16) and self.ablit[0] != 0.0:
                     y = ablit_runtime.project_widen(y, self.ablit[0], *self.ablit[2:])
                 else:
                     ablit_runtime.project(y, self.ablit[0], *self.ablit[2:])

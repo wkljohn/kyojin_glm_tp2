@@ -374,7 +374,7 @@ class HyperConnection(Module):
         b, s, H, D = x.shape
         return (b * s > 256 and b * s <= 65536 and H == 4 and D % 4 == 0
                 and x.dtype == torch.float and x.is_contiguous()
-                and y.dtype in (torch.float, torch.half) and y.is_contiguous() and y.numel() == b * s * D
+                and y.dtype in (torch.float, torch.half, torch.bfloat16) and y.is_contiguous() and y.numel() == b * s * D
                 and post.dtype == torch.float and post.is_contiguous()
                 and comb.dtype == torch.float and comb.is_contiguous() and _hc_mix_supported(x.device))
 
@@ -499,7 +499,7 @@ class HyperConnection(Module):
         converting = "quant_preserve" in params or "capture" in params
         if hasattr(ext, "hc_apply") and not converting and _hc_mix_supported(x.device) \
                 and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
-                and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
+                and y.dtype in (torch.float, torch.half, torch.bfloat16) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
             ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H))

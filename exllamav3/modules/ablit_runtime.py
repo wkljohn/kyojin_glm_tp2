@@ -204,10 +204,11 @@ def project(y: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> 
 
 
 def project_widen(x: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> torch.Tensor:
-    """EXL3_NC2_ABLIT_F16: fp32 result of project(x.float(), ...) for an fp16 x, in one pass when the Triton kernel
+    """EXL3_NC2_ABLIT_F16: fp32 result of project(x.float(), ...) for an fp16 (or bf16: EP wire) x, in one pass when the Triton kernel
     applies (bit-equal: the widen is exact and the kernel arithmetic is the fp32 one). Returns a new fp32 tensor."""
     h = r32.shape[0]
-    if w == 0.0 or ROW_MODE is not None or not _USE_TRITON or not x.is_contiguous() or x.dtype != torch.half:
+    if w == 0.0 or ROW_MODE is not None or not _USE_TRITON or not x.is_contiguous() or \
+            x.dtype not in (torch.half, torch.bfloat16):
         return project(x.float(), w, r32, r16)
     y = torch.empty(x.shape, dtype = torch.float32, device = x.device)
     x2 = x.view(-1, h)

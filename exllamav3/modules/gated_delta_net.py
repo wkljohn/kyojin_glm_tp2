@@ -1826,13 +1826,17 @@ class GatedDeltaNet(Module):
             self._pfe_f16_out(self.o_proj, core_attn_out, params, "EXL3_PFE_OPROJ") else None
         x = self.o_proj.forward(core_attn_out, params, o_dt)
 
-        # TP reduction
+        # TP reduction (EP prefill with an fp16 o_proj output: the bf16 wire sum goes straight to the block's widen)
+        f16_keep = out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+            os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1"
         if self.tp_reduce:
-            (self.ep or params["backend"]).all_reduce(x)
+            if self.ep is not None:
+                x = self.ep.all_reduce(x, ret_bf16 = f16_keep and params.get("pfe_y_bf16_ok", False))
+            else:
+                params["backend"].all_reduce(x)
 
         # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
-        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
-                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+        if f16_keep:
             return x
         return to2(x, out_dtype, self.out_dtype)
 

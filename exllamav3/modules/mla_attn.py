@@ -592,12 +592,13 @@ class MLAttention(Module):
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
         if x is None:
             return None                          # EXL3_PF_SKIP: kv_only, see _attend
+        f16_keep = out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+            os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1"
         if self.ep is not None:
-            self.ep.all_reduce(x)
+            x = self.ep.all_reduce(x, ret_bf16 = f16_keep and params.get("pfe_y_bf16_ok", False))
         # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
         # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
-        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
-                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+        if f16_keep:
             return x
         return to2(x, out_dtype, self.out_dtype)
 

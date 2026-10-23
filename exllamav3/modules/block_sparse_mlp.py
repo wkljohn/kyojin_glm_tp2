@@ -2162,10 +2162,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Output reduction
         if self.tp_reduce and not pre_norm_reduce:
-            self._reduce_backend(params).all_reduce(
-                final_hidden_states,
-                (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
-            )
+            contrib = (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
+            if self.ep is not None:
+                final_hidden_states = self.ep.all_reduce(
+                    final_hidden_states, contrib,
+                    ret_bf16 = out_dtype is None and params.get("ep_mlp_bf16_ok", False))
+            else:
+                self._reduce_backend(params).all_reduce(final_hidden_states, contrib)
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)

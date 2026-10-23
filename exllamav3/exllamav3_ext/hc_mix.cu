@@ -284,6 +284,15 @@ hc_mix_norm: hc_mix (non-head) with the consumer's RMSNorm fused into the finali
 
 #define HCN_MAX 32
 
+// bf16 sublayer output (EP: the bf16 wire sum, consumed without a copy back): raw 16-bit storage, widened exactly
+struct hc_bf16 { uint16_t v; };
+__device__ __forceinline__ float4 hc_ld4_bf16(const hc_bf16* p, int c)
+{
+    const uint2 pk = ((const uint2*) p)[c];
+    return make_float4(__uint_as_float(pk.x << 16), __uint_as_float(pk.x & 0xffff0000u),
+                       __uint_as_float(pk.y << 16), __uint_as_float(pk.y & 0xffff0000u));
+}
+
 __device__ __forceinline__ float hcn_ld_w(const void* w, int wtype, int i)
 {
     if (wtype == 1) return __half2float(reinterpret_cast<const half*>(w)[i]);
@@ -660,7 +669,9 @@ void hc_pf_apply_mix_norm_1pass_kernel
                 xv[h] = x4[(size_t) h * D4 + c];
 
             float4 yv;
-            if constexpr (std::is_same_v<Y_T, half>)
+            if constexpr (std::is_same_v<Y_T, hc_bf16>)
+                yv = hc_ld4_bf16(ya + (size_t) r * D, c);
+            else if constexpr (std::is_same_v<Y_T, half>)
             {
                 half2 y01 = ((const half2*) (ya + (size_t) r * D))[c * 2];
                 half2 y23 = ((const half2*) (ya + (size_t) r * D))[c * 2 + 1];
@@ -819,7 +830,9 @@ void hc_pf_apply_mix_norm_rb_kernel
                 for (int h = 0; h < H; ++h)
                     xv[h] = x4[(size_t) h * D4 + c];
                 float4 yv;
-                if constexpr (std::is_same_v<Y_T, half>)
+                if constexpr (std::is_same_v<Y_T, hc_bf16>)
+                    yv = hc_ld4_bf16(ya + (size_t) r * D, c);
+                else if constexpr (std::is_same_v<Y_T, half>)
                 {
                     half2 y01 = ((const half2*) (ya + (size_t) r * D))[c * 2];
                     half2 y23 = ((const half2*) (ya + (size_t) r * D))[c * 2 + 1];
@@ -1191,7 +1204,9 @@ void hc_apply_kernel
             xv[h] = x4[(size_t) h * D4 + c];
 
         float4 yv;
-        if constexpr (std::is_same_v<Y_T, half>)
+        if constexpr (std::is_same_v<Y_T, hc_bf16>)
+            yv = hc_ld4_bf16(y + (size_t) r * D, c);
+        else if constexpr (std::is_same_v<Y_T, half>)
         {
             half2 y01 = ((const half2*) (y + (size_t) r * D))[c * 2];
             half2 y23 = ((const half2*) (y + (size_t) r * D))[c * 2 + 1];
@@ -1974,8 +1989,8 @@ void hc_apply
     hc_check_common(y, device, "hc_apply", "y");
     hc_check_common(post, device, "hc_apply", "post");
     TORCH_CHECK(x.scalar_type() == at::kFloat, "hc_apply: x must have dtype float32");
-    TORCH_CHECK(y.scalar_type() == at::kFloat || y.scalar_type() == at::kHalf,
-                "hc_apply: y must have dtype float32 or float16");
+    TORCH_CHECK(y.scalar_type() == at::kFloat || y.scalar_type() == at::kHalf || y.scalar_type() == at::kBFloat16,
+                "hc_apply: y must have dtype float32, float16 or bfloat16");
     TORCH_CHECK(post.scalar_type() == at::kFloat, "hc_apply: post must have dtype float32");
     TORCH_CHECK(y.dim() == 2 && y.size(0) == R && y.size(1) == D,
                 "hc_apply: y must have shape (R, D)");
@@ -2008,7 +2023,12 @@ void hc_apply
     #define ARGS(Y_T) \
         (float*) x.data_ptr(), (const Y_T*) y.data_ptr(), \
         (const float*) post.data_ptr(), comb_p, D, chunk_cols
-    if (y.dtype() == at::kHalf)
+    if (y.dtype() == at::kBFloat16)
+    {
+        if (comb_p) { hc_apply_kernel<4, hc_bf16, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(hc_bf16)); }
+        else { hc_apply_kernel<4, hc_bf16, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(hc_bf16)); }
+    }
+    else if (y.dtype() == at::kHalf)
     {
         if (comb_p) hc_apply_kernel<4, half, true><<<grid, NUM_THREADS, 0, stream>>>(ARGS(half));
         else        hc_apply_kernel<4, half, false><<<grid, NUM_THREADS, 0, stream>>>(ARGS(half));
@@ -2070,7 +2090,8 @@ void hc_pf_apply_mix_norm
                 comb_a.scalar_type() == at::kFloat && base.scalar_type() == at::kFloat &&
                 scale.scalar_type() == at::kFloat && partials.scalar_type() == at::kFloat &&
                 post.scalar_type() == at::kFloat && comb.scalar_type() == at::kFloat, op, ": dtype");
-    TORCH_CHECK(ya.scalar_type() == at::kFloat || ya.scalar_type() == at::kHalf, op, ": ya dtype");
+    TORCH_CHECK(ya.scalar_type() == at::kFloat || ya.scalar_type() == at::kHalf || ya.scalar_type() == at::kBFloat16,
+                op, ": ya dtype");
     TORCH_CHECK(fn.scalar_type() == at::kFloat || fn.scalar_type() == at::kHalf, op, ": fn dtype");
     TORCH_CHECK(y.scalar_type() == at::kHalf && y.dim() == 2 && y.size(0) == R && y.size(1) == D, op, ": y must be half (R, D)");
     const int ldy = (int) y.stride(0);
@@ -2111,6 +2132,13 @@ void hc_pf_apply_mix_norm
         (float*) post.data_ptr(), (float*) comb.data_ptr(), (half*) y.data_ptr(), \
         wtype ? w->data_ptr() : nullptr, wtype, D, (float) rms_eps, (float) hc_eps, \
         (int) sinkhorn_iters, (float) norm_eps, (float) constant_bias, (float) constant_scale, ldy
+    if (ya.dtype() == at::kBFloat16)
+    {
+        if (fn.dtype() == at::kHalf) { hc_pf_apply_mix_norm_1pass_kernel<4, 24, hc_bf16, half><<<grid, NUM_THREADS + 32, 0, stream>>>(PF_ARGS(hc_bf16, half)); }
+        else { hc_pf_apply_mix_norm_1pass_kernel<4, 24, hc_bf16, float><<<grid, NUM_THREADS + 32, 0, stream>>>(PF_ARGS(hc_bf16, float)); }
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
     static int rb = -1;
     if (rb < 0) { const char* e = getenv("EXL3_PF_HC_RB"); rb = e ? atoi(e) : 1; }   // measured: 1-row kernel is already near its DRAM floor (RB 2/4 slower at R = 1024)
     if (rb == 4 || rb == 2)

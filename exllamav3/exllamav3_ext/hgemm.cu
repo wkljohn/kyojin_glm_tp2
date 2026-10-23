@@ -1406,3 +1406,111 @@ void hgemm_batched
     cublas_check(r);
     cuda_check(cudaPeekAtLastError());
 }
+
+/*
+DFlash2 grouped causal convolution (architecture/dflash2.py _convolve) in one launch instead of ~25 elementwise ops:
+out[b, s, h] = sum_t (base[t, g, i] + delta[b, s, t, g]) * x[b, s - t, h] over taps t with (s % block) >= t, h = g * gs + i.
+Same fp32 operation order as the torch reference (c0 * x, then += (c_t * x_t) per tap, no fused multiply-add), so
+the result is bit-identical. x: [B, S, H] half or float, contiguous; delta: fp32 with strides (b, s, t, g); out: [B, S, H]
+half or float.
+*/
+__device__ __forceinline__ float dc_to_f(half v) { return __half2float(v); }
+__device__ __forceinline__ float dc_to_f(float v) { return v; }
+__device__ __forceinline__ void dc_store(half* p, float v) { *p = __float2half_rn(v); }
+__device__ __forceinline__ void dc_store(float* p, float v) { *p = v; }
+// HIP builds with -ffp-contract=fast, which ignores contraction pragmas: a separately rounded multiply (no FMA with
+// the following add) needs its own instruction
+__device__ __forceinline__ float dc_mul(float a, float b)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    float r;
+    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+#else
+    return a * b;
+#endif
+}
+
+template <typename XT, typename OT>
+__global__ void dflash2_conv_kernel(const XT* __restrict__ x, const float* __restrict__ base,
+                                    const float* __restrict__ delta, OT* __restrict__ out,
+                                    int B, int S, int H, int taps, int gs, int block,
+                                    int64_t ds_b, int64_t ds_s, int64_t ds_t, int64_t ds_g)
+{
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t) B * S * H) return;
+    const int h = idx % H;
+    const int s = (idx / H) % S;
+    const int b = idx / ((int64_t) H * S);
+    const int g = h / gs;
+    const int G = H / gs;
+    const int pos = s % block;
+    const float* dl = delta + b * ds_b + s * ds_s + g * ds_g;
+    float acc = dc_mul(base[(size_t) g * gs + (h % gs)] + dl[0], dc_to_f(x[idx]));
+    for (int t = 1; t < taps; ++t)
+    {
+        if (pos < t) break;
+        const float c = base[((size_t) t * G + g) * gs + (h % gs)] + dl[t * ds_t];
+        acc = acc + dc_mul(c, dc_to_f(x[idx - (int64_t) t * H]));
+    }
+    dc_store(out + idx, acc);
+}
+
+void dflash2_conv(at::Tensor x, at::Tensor base, at::Tensor delta, at::Tensor out, int64_t block)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(x.dim() == 3 && x.is_contiguous() && out.is_contiguous() && out.sizes() == x.sizes(), "dflash2_conv: x/out");
+    TORCH_CHECK(base.dtype() == at::kFloat && base.is_contiguous() && base.dim() == 3, "dflash2_conv: base [taps, G, gs]");
+    TORCH_CHECK(delta.dtype() == at::kFloat && delta.dim() == 4, "dflash2_conv: delta [B, S, taps, G]");
+    const int B = x.size(0), S = x.size(1), H = x.size(2);
+    const int taps = base.size(0), gs = base.size(2);
+    TORCH_CHECK(base.size(1) * gs == H && delta.size(2) == taps && delta.size(3) == base.size(1), "dflash2_conv: shapes");
+    const int64_t n = (int64_t) B * S * H;
+    const int threads = 256;
+    const int blocks = (int) ((n + threads - 1) / threads);
+    #define DC_LAUNCH(XT, OT) dflash2_conv_kernel<XT, OT><<<blocks, threads, 0, stream>>>( \
+        (const XT*) x.data_ptr(), (const float*) base.data_ptr(), (const float*) delta.data_ptr(), (OT*) out.data_ptr(), \
+        B, S, H, taps, gs, (int) block, delta.stride(0), delta.stride(1), delta.stride(2), delta.stride(3))
+    const bool xh = x.dtype() == at::kHalf, oh = out.dtype() == at::kHalf;
+    TORCH_CHECK((xh || x.dtype() == at::kFloat) && (oh || out.dtype() == at::kFloat), "dflash2_conv: dtypes");
+    if (xh && oh) { DC_LAUNCH(half, half); }
+    else if (xh) { DC_LAUNCH(half, float); }
+    else if (oh) { DC_LAUNCH(float, half); }
+    else { DC_LAUNCH(float, float); }
+    #undef DC_LAUNCH
+    cuda_check(cudaPeekAtLastError());
+}
+
+/*
+DFlash2 selector greedy walk (architecture/dflash2.py DFlash2Selector.select): sel[b, l] = argmax_c scores[b, l, p, c]
+with p = sel[b, l - 1] (p = 0 at l = 0), first index on ties like torch.argmax. One thread per batch row: L x k is tiny,
+and the walk is serial; this replaces ~6 launches per draft position.
+*/
+__global__ void dflash2_walk_kernel(const float* __restrict__ scores, int64_t* __restrict__ sel, int B, int L, int K)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) return;
+    int p = 0;
+    for (int l = 0; l < L; ++l)
+    {
+        const float* s = scores + (((size_t) b * L + l) * K + p) * K;
+        int best = 0;
+        float bv = s[0];
+        for (int c = 1; c < K; ++c)
+            if (bv == bv && (s[c] > bv || s[c] != s[c])) { bv = s[c]; best = c; }   // NaN wins, like torch
+        sel[(size_t) b * L + l] = best;
+        p = best;
+    }
+}
+
+void dflash2_walk(at::Tensor scores, at::Tensor sel)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(scores.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(scores.dtype() == at::kFloat && scores.is_contiguous() && scores.dim() == 4, "dflash2_walk: scores [B, L, K, K] fp32");
+    TORCH_CHECK(sel.dtype() == at::kLong && sel.is_contiguous(), "dflash2_walk: sel int64 [B, L]");
+    const int B = scores.size(0), L = scores.size(1), K = scores.size(2);
+    dflash2_walk_kernel<<<(B + 63) / 64, 64, 0, stream>>>((const float*) scores.data_ptr(), (int64_t*) sel.data_ptr(), B, L, K);
+    cuda_check(cudaPeekAtLastError());
+}

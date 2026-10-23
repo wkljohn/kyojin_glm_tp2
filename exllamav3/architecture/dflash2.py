@@ -8,6 +8,10 @@ from ..model.config import no_default
 from ..modules import RMSNorm, TransformerBlock, Linear
 from ..modules.module import Module
 from .dflash import DFlashConfig, DFlashModel
+from ..ext import exllamav3_ext as ext
+
+_FUSED_CONV = os.environ.get("EXL3_DFLASH2_CONV", "1") != "0" and hasattr(ext, "dflash2_conv")
+_FUSED_WALK = os.environ.get("EXL3_DFLASH2_WALK", "1") != "0" and hasattr(ext, "dflash2_walk")
 
 # DFlash 2 drafter (incoai GLM-5.3-Flash-DFlash2, z-lab dflash v2). Differences from DFlash (dflash.py):
 #  - every decoder layer wraps attention and MLP in a grouped two-tap dynamic convolution over the
@@ -80,9 +84,15 @@ class DFlash2GroupedConv(Module):
     def get_tensors(self):
         return {f"{self.key}.base_kernel": self.base_kernel} if self.base_kernel is not None else {}
 
-    def _convolve(self, x: torch.Tensor, delta: torch.Tensor, side: int) -> torch.Tensor:
-        # x (bsz, seq, H) any float dtype, delta (bsz, seq, taps, G) fp32 -> (bsz, seq, H) fp32
+    def _convolve(self, x: torch.Tensor, delta: torch.Tensor, side: int, out_dtype = torch.float) -> torch.Tensor:
+        # x (bsz, seq, H) any float dtype, delta (bsz, seq, taps, G) fp32 -> (bsz, seq, H) out_dtype
         bsz, seq, _ = x.shape
+        # EXL3_DFLASH2_CONV (default 1): one fused launch (ext.dflash2_conv, bit-identical) instead of ~25 elementwise ops
+        if _FUSED_CONV and x.dtype in (torch.half, torch.float) and delta.dtype == torch.float and x.is_cuda:
+            xc = x.contiguous()
+            out = torch.empty((bsz, seq, self.hidden_size), dtype = out_dtype, device = x.device)
+            ext.dflash2_conv(xc, self.base_kernel[side], delta, out, self.block_size)
+            return out
         blocks = x.float().view(bsz, seq, self.num_groups, self.group_size)
         coef = self.base_kernel[side].view(1, 1, self.taps, self.num_groups, self.group_size) + delta.unsqueeze(-1)
         out = coef[:, :, 0] * blocks
@@ -90,12 +100,12 @@ class DFlash2GroupedConv(Module):
         for tap in range(1, self.taps):
             shifted = F.pad(blocks[:, :-tap], (0, 0, 0, 0, tap, 0))
             out += coef[:, :, tap] * shifted * (pos >= tap).view(1, -1, 1, 1)
-        return out.view(bsz, seq, self.hidden_size)
+        return out.view(bsz, seq, self.hidden_size).to(out_dtype)
 
     def prepare(self, x: torch.Tensor, params: dict):
         bsz, seq, _ = x.shape
         c = self.kernel_projection.forward(x.half(), params).view(bsz, seq, 2, self.taps, self.num_groups)
-        return self._convolve(x, c[:, :, 0], 0).half(), c[:, :, 1]
+        return self._convolve(x, c[:, :, 0], 0, torch.half), c[:, :, 1]
 
     def finish(self, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         return self._convolve(y, c, 1)
@@ -193,13 +203,23 @@ class DFlash2Selector(Module):
         pair = torch.einsum("blpr,blcr->blpc", pred * h.unsqueeze(2), succ)
         self.last_unary, self.last_pair = unary, pair
         scores = unary.unsqueeze(2) + pair
+        psel = os.environ.get("KYOJIN_DRAFT_PSEL")
+        if _FUSED_WALK:
+            # One launch for the serial argmax chain (ext.dflash2_walk), then vectorized gathers: same picks and values
+            sel = torch.empty((b, L), dtype = torch.long, device = cand.device)
+            scores = scores.contiguous()
+            ext.dflash2_walk(scores, sel)
+            prev_sel = torch.cat((torch.zeros((b, 1), dtype = torch.long, device = cand.device), sel[:, :-1]), dim = 1)
+            s_all = scores.gather(2, prev_sel.view(b, L, 1, 1).expand(b, L, 1, k)).squeeze(2)      # (b, L, k)
+            path = cand.gather(2, sel.unsqueeze(-1)).squeeze(-1)
+            src = torch.softmax(s_all.float(), dim = -1) if psel else s_all
+            return path, src.gather(2, sel.unsqueeze(-1)).squeeze(-1)
         rows = torch.arange(b, device = cand.device)
         p = torch.zeros(b, dtype = torch.long, device = cand.device)
         path, conf = [], []
         # KYOJIN_DRAFT_PSEL: the per-position confidence is the softmax probability of the chosen candidate among the
         # top-k (a sharper acceptance predictor than the raw score; replayed against true greedy text it truncates the
         # verify window far better), compared against that fixed threshold instead of the calibrator
-        psel = os.environ.get("KYOJIN_DRAFT_PSEL")
         for step in range(L):
             s = scores[rows, step, p]                                                # (b, k)
             sel = s.argmax(dim = -1)

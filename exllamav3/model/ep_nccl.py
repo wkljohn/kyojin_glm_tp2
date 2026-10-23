@@ -41,16 +41,34 @@ class PyNccl:
         lib.ncclAllReduce.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
                                       ctypes.c_void_p, ctypes.c_void_p]
         lib.ncclGetErrorString.restype = ctypes.c_char_p
+        self.device = device
+        self.comm = self._init_comm(rank, world, device)
+        # KYOJIN_EP_PYNCCL_SIMPLE_MIN (bytes, default 0 = off): payloads from this size go through a second
+        # communicator created with NCCL_PROTO=Simple (Simple beats LL from 2 decode rows on: 4 rows bf16 44.5 vs 54 us).
+        # Measured no effect: this RCCL reads NCCL_PROTO once per process, so the second comm keeps the first's choice
+        self.simple_min = int(os.environ.get("KYOJIN_EP_PYNCCL_SIMPLE_MIN", 0))
+        self.comm_simple = None
+        if self.simple_min:
+            old = os.environ.get("NCCL_PROTO")
+            os.environ["NCCL_PROTO"] = "Simple"
+            try:
+                self.comm_simple = self._init_comm(rank, world, device)
+            finally:
+                if old is None: del os.environ["NCCL_PROTO"]
+                else: os.environ["NCCL_PROTO"] = old
+
+    def _init_comm(self, rank, world, device):
+        lib = self.lib
         uid = _UniqueId()
         if rank == 0:
             self._check(lib.ncclGetUniqueId(ctypes.byref(uid)))
         t = torch.tensor(list(bytes(uid.internal)), dtype = torch.uint8, device = device)
         dist.broadcast(t, src = 0)
         ctypes.memmove(uid.internal, bytes(t.cpu().tolist()), 128)
-        self.comm = ctypes.c_void_p()
+        comm = ctypes.c_void_p()
         with torch.cuda.device(device):
-            self._check(lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
-        self.device = device
+            self._check(lib.ncclCommInitRank(ctypes.byref(comm), world, uid, rank))
+        return comm
 
     def _check(self, rc: int):
         if rc != 0:
@@ -59,6 +77,8 @@ class PyNccl:
     def all_reduce(self, t: torch.Tensor, op: str = "sum"):
         """In place, on the current stream."""
         assert t.is_contiguous() and t.device == self.device
+        comm = self.comm_simple if self.comm_simple is not None and \
+            t.numel() * t.element_size() >= self.simple_min else self.comm
         self._check(self.lib.ncclAllReduce(
             ctypes.c_void_p(t.data_ptr()), ctypes.c_void_p(t.data_ptr()), t.numel(), _DTYPES[t.dtype], _OPS[op],
-            self.comm, ctypes.c_void_p(torch.cuda.current_stream(self.device).cuda_stream)))
+            comm, ctypes.c_void_p(torch.cuda.current_stream(self.device).cuda_stream)))

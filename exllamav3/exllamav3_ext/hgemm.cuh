@@ -21,6 +21,8 @@ void hgemm_q8_gr(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, Graph
 void hgemm_q8(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c);
 void hgemm_q8_range(at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c, at::Tensor rng, int64_t mode);
 void ep_shared_range(at::Tensor sel, int64_t n_local, int64_t n_experts, int64_t rank, int64_t nb, double sb, double w1, double b1, at::Tensor rng);
+void dflash2_conv(at::Tensor x, at::Tensor base, at::Tensor delta, at::Tensor out, int64_t block);
+void dflash2_walk(at::Tensor scores, at::Tensor sel);
 #endif
 #endif
 

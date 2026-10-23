@@ -40,6 +40,7 @@ from .mla_attn import MLAttention, MAX_DECODE_QLEN as _MLA_MAX_QLEN
 _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 
 BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "0") == "1"
+_EP_GRAPH = os.environ.get("KYOJIN_EP_BLOCK_GRAPH", "0") != "0"
 BLOCK_GRAPH_WARMUPS = max(1, _env_int("EXL3_BLOCK_GRAPH_WARMUPS", 3))
 BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
 
@@ -186,6 +187,12 @@ class BlockGraphRunner:
         if getattr(attn, "qsa_indexer", None) is not None:
             self.stats["declines"]["qsa"] += 1
             return None
+        # A layer whose hidden state the draft model reads (DFlash export_state_layers) stays eager: the
+        # graph does not record the export
+        export = params.get("export_state_layers")
+        if export and block.layer_idx in export:
+            self.stats["declines"]["export_state"] += 1
+            return None
         if not self._mlp_io_ok(x, params):
             return None
         bsz, seqlen = x.shape[0], x.shape[1]
@@ -223,8 +230,12 @@ class BlockGraphRunner:
                      getattr(mlp, "support_hip_prefill", False) or dec_moe_ok):
             self.stats["declines"]["mlp_route"] += 1
             return False
-        if getattr(mlp, "tp_mode", None) is not None or getattr(attn, "tp_reduce", False) or \
-                getattr(mlp, "tp_reduce", False):
+        # KYOJIN_EP_BLOCK_GRAPH=1: cross-host EP blocks are capturable too (their all-reduce goes through the pynccl
+        # communicator on the capture stream; RCCL graph capture needs NCCL_GRAPH_MIXING_SUPPORT=1, set in ep_launch)
+        ep_ok = _EP_GRAPH and getattr(mlp, "ep", None) is not None and getattr(getattr(mlp, "ep", None), "pynccl", None) is not None \
+            and getattr(mlp, "tp_mode", None) is None
+        if not ep_ok and (getattr(mlp, "tp_mode", None) is not None or getattr(attn, "tp_reduce", False) or
+                          getattr(mlp, "tp_reduce", False)):
             self.stats["declines"]["tp"] += 1
             return False
         if x.device != torch.device(self.block.device) or x.device.type != "cuda":

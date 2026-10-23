@@ -181,6 +181,8 @@ def main():
     ap.add_argument("--fixed-draft", type = int, default = 0,
                     help = "verify-cost probe: every round verifies this many constant junk draft tokens (all rejected), "
                            "so ms/round is the target's verify cost, independent of acceptance and of the text")
+    ap.add_argument("--save-logits", action = "store_true",
+                    help = "decode-path QC: rank 0 saves each family's generated ids and per-token logits (logits-<fam>.pt)")
     ap.add_argument("--ngram", default = None, help = "n-gram lookup ahead of the drafter: nmin,K,lmin[,cmin] (GLM server default 2,7,16,3)")
     args = ap.parse_args()
 
@@ -236,9 +238,18 @@ def main():
 
     def run_case(ids):
         job = Job(input_ids = ids, max_new_tokens = args.gen_tokens, min_new_tokens = args.gen_tokens,
-                  sampler = GreedySampler(), stop_conditions = [], decode_special_tokens = True)
+                  sampler = GreedySampler(), stop_conditions = [], decode_special_tokens = True,
+                  return_logits = args.save_logits)
+        pre = os.environ.get("KYOJIN_BENCH_PRE")   # diagnostics only: "empty" (allocator) / "burst" (GPU busy first)
+        if pre == "empty":
+            torch.cuda.synchronize(); torch.cuda.empty_cache()
+        elif pre == "burst":
+            a = torch.randn(4096, 4096, device = "cuda", dtype = torch.half)
+            for _ in range(60): a = a @ a; a = a / a.norm()
+            torch.cuda.synchronize()
         generator.enqueue(job)
         toks, last, text = [], None, []
+        run_case.logits = []
         torch.cuda.synchronize()
         t = time.perf_counter()
         while generator.num_remaining_jobs():
@@ -246,6 +257,8 @@ def main():
                 if r.get("stage") == "streaming":
                     if r.get("token_ids") is not None:
                         toks += r["token_ids"].flatten().tolist()
+                    if r.get("logits") is not None:
+                        run_case.logits.append(r["logits"].reshape(-1, r["logits"].shape[-1]).half().cpu())
                     text.append(r.get("text", ""))
                     if r.get("eos"):
                         last = r
@@ -289,6 +302,8 @@ def main():
                       + (f"  accept {row['accept_rate']}" if row["accept_rate"] is not None else "")
                       + f"  agree={agree}  sha {digest}", flush = True)
                 (out / f"sample-{fam}.txt").write_text(text)
+                if args.save_logits and run_case.logits:
+                    torch.save({"ids": torch.tensor(toks), "logits": torch.cat(run_case.logits)}, out / f"logits-{fam}.pt")
 
     if rank == 0:
         def mean(k):
@@ -314,6 +329,15 @@ def main():
         print("[bench] summary " + json.dumps({k: summary[k] for k in (
             "prefill_tps_mean", "decode_tps_mean", "prefill_tps_min", "decode_tps_min", "accept_rate_mean", "all_ranks_agree")}),
             flush = True)
+    if os.environ.get("EXL3_SPEC_PROF") == "1":
+        from exllamav3.generator import generator as _gm
+        recs = _gm.SPEC_PROF_REC
+        keys = sorted({k for r in recs for k in r if isinstance(r.get(k), float)})
+        print(f"[bench] rank {rank} spec prof ({len(recs)} rounds, ms mean): " +
+              "  ".join(f"{k} {sum(r.get(k, 0.0) for r in recs) / max(1, len(recs)) * 1e3:.2f}" for k in keys), flush = True)
+    if os.environ.get("EXL3_BLOCK_GRAPH") == "1":
+        from exllamav3.modules import block_graph
+        print(f"[bench] rank {rank} block graphs: {block_graph.global_stats()}", flush = True)
     if ep:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()

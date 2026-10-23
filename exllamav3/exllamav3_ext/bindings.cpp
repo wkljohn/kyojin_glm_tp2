@@ -352,6 +352,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("q8_dequant", &q8_dequant, "q8_dequant");
     m.def("hgemm_q8_range", &hgemm_q8_range, "hgemm_q8_range");
     m.def("ep_shared_range", &ep_shared_range, "ep_shared_range");
+    m.def("dflash2_conv", &dflash2_conv, "dflash2_conv");
+    m.def("dflash2_walk", &dflash2_walk, "dflash2_walk");
     m.def("hgemm_q8", [](at::Tensor a, at::Tensor qw, at::Tensor qs, at::Tensor c)
           {
               if (hgemm_gil_free(a)) { py::gil_scoped_release nogil; hgemm_q8(a, qw, qs, c); }

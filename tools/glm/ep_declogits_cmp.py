@@ -26,7 +26,8 @@ def main(ref_dir, test_dir):
         m = min(agree + 1, n)
         lr = torch.log_softmax(r["logits"][:m].float(), -1)
         lt = torch.log_softmax(t["logits"][:m].float(), -1)
-        kl = (lr.exp() * (lr - lt)).sum(-1)
+        pr = lr.exp()
+        kl = torch.where(pr > 0, pr * (lr - lt), torch.zeros_like(pr)).sum(-1)   # -inf (masked vocab) terms count 0
         top1 = (lr.argmax(-1) == lt.argmax(-1)).float().mean()
         print(f"{f[7:-3]:8s} agreed {agree:4d}/{n}  KL mean {kl.mean():.5f}  max {kl.max():.4f}  top1 {top1:.4f}")
         tot_kl += float(kl.sum())

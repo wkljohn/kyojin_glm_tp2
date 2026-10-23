@@ -188,7 +188,10 @@ class EPState:
             tensor.zero_()
         # Large fp32 payloads (prefill chunks) go over the wire as bf16: half the bytes on a ~2 GB/s link.
         # Every rank gets the same rounded sum, so the ranks stay identical. KYOJIN_EP_BF16_MIN=0 disables
-        ar = self.pynccl.all_reduce if self.pynccl is not None else dist.all_reduce
+        # pynccl only while no two-batch overlap is active: TBO issues its all-reduces from two threads on torch's
+        # communicator, and a second communicator interleaved with them can be ordered differently on each rank
+        # (a cross-communicator deadlock, seen once in ~40 prefills). Decode is single-threaded: one order everywhere
+        ar = self.pynccl.all_reduce if self.pynccl is not None and self.tbo is None else dist.all_reduce
         if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min:
             t = tensor.to(torch.bfloat16)
             ar(t)
@@ -432,5 +435,13 @@ def ep_state() -> EPState | None:
         t = torch.full((4096,), float(rank + 1), device = _STATE.pynccl.device)
         _STATE.pynccl.all_reduce(t)
         assert float(t[0]) == world * (world + 1) / 2, "EP pynccl self-test failed"
+        # Establish both communicators' large-message (Simple) connections now, one after the other, so no lazy
+        # connection setup of one communicator runs while the other is mid-collective later (prefill size, bf16)
+        big = torch.ones((4096 * 1024,), dtype = torch.bfloat16, device = _STATE.pynccl.device)
+        dist.all_reduce(big)
+        torch.cuda.synchronize()
+        _STATE.pynccl.all_reduce(big)
+        torch.cuda.synchronize()
+        del big
     print(f" -- EP rank {rank}/{world} ready (torch.distributed nccl)", flush = True)
     return _STATE

@@ -237,6 +237,18 @@ class GDNState:
         self.position = 0
 
 
+
+def _fp16_widen_linear(m, rows: int) -> bool:
+    """A LinearFP16 (fp16 or Q8 weight) whose fp32 output would be an fp16 GEMM plus a widen (quant/fp16.py
+    _f32_via_f16): its fp16 output holds the same values, so callers may take fp16 and widen in the consumer."""
+    from .quant import fp16 as _fp16
+    inner = m.inner
+    return (type(inner).__name__ == "LinearFP16" and inner.bias is None and _fp16._f32_via_f16 and
+            rows >= _fp16._f32_via_f16_min_rows and not m.lora_a_tensors and m.pre_scale == 1.0 and
+            m.post_scale == 1.0 and m.softcap == 0.0 and m.out_features == m.out_features_unpadded and
+            os.environ.get("EXL3_FP16_WIDEN_OUT", "1") != "0")
+
+
 class GDNLayerState:
 
     def __init__(
@@ -1188,6 +1200,8 @@ class GatedDeltaNet(Module):
         rows = x.numel() // x.shape[-1]
         if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
             return False
+        if _fp16_widen_linear(m, rows):
+            return True
         if type(m.inner).__name__ != "LinearEXL3" or m.inner.bias is not None:
             return False
         if rows <= _exl3.AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct \
@@ -1208,6 +1222,8 @@ class GatedDeltaNet(Module):
         from .quant import exl3 as _exl3
         m = self.qkv_proj
         rows = x.numel() // x.shape[-1]
+        if _fp16_widen_linear(m, rows):
+            return True
         if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
             return False
         if type(m.inner).__name__ != "LinearEXL3" or m.inner.bias is not None:

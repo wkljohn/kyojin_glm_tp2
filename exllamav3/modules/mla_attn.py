@@ -645,6 +645,9 @@ class MLAttention(Module):
             return False
         from .quant import exl3 as _exl3
         rows = x.numel() // x.shape[-1]
+        from .gated_delta_net import _fp16_widen_linear
+        if _fp16_widen_linear(m, rows):
+            return True     # fp16 / Q8 weight: the fp32 output is the same fp16 GEMM plus a widen
         return bool(
             _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1)
             and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None

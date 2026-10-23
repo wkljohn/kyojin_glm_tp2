@@ -770,6 +770,175 @@ void hc_pf_apply_mix_norm_1pass_kernel
 
 
 /*
+hc_pf_apply_mix_norm, RB rows per block (EXL3_PF_HC_RB=2|4, default off: measured slower, the 1-row kernel is DRAM-bound): the 1-row kernel above re-reads the whole site-B
+mixer (M x H*D, 786 KB at fp16) once per ROW from cache, through the 64 partial-loop threads. Here every block takes RB
+rows: phase A runs per row as before, and in the partials loop each thread loads a mixer element once and applies it to
+all RB rows, keeping its own per-row accumulation order (same c sequence, same fmaf chain), then the same warp
+reduction and finalize per row. Bit-identical to the 1-row kernel; RB times less mixer traffic.
+*/
+template <int H, int M_, typename Y_T, typename FN_T, int RB>
+__global__ __launch_bounds__(NUM_THREADS + 32)
+void hc_pf_apply_mix_norm_rb_kernel
+(
+    float* __restrict__ x, const Y_T* __restrict__ ya, const float* __restrict__ post_a,
+    const float* __restrict__ comb_a, const FN_T* __restrict__ fn, float* __restrict__ partials,
+    int* __restrict__ tickets, const float* __restrict__ base, const float* __restrict__ scale,
+    float* __restrict__ post, float* __restrict__ comb, half* __restrict__ y, const void* __restrict__ w,
+    const int wtype, const int D, const float rms_eps, const float hc_eps, const int sinkhorn_iters,
+    const float norm_eps, const float constant_bias, const float constant_scale, const int ldy, const int R
+)
+{
+    constexpr int M = M_;
+    const int r0 = blockIdx.y * RB;
+    const int nr = min(RB, R - r0);
+    const int row_len = H * D;
+    const int row_len4 = row_len / 4;
+    const int D4 = D / 4;
+
+    // ---- Phase A per row (hc_apply_kernel<4, Y_T, true> verbatim)
+    for (int rr = 0; rr < nr; ++rr)
+    {
+        const int r = r0 + rr;
+        if (threadIdx.x < NUM_THREADS)
+        {
+            float post_r[H];
+            float comb_r[H][H];
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                post_r[h] = __ldg(post_a + (size_t) r * H + h);
+                #pragma unroll
+                for (int g = 0; g < H; ++g)
+                    comb_r[h][g] = __ldg(comb_a + ((size_t) r * H + h) * H + g);
+            }
+            float4* x4 = (float4*) (x + (size_t) r * row_len);
+            for (int c = threadIdx.x; c < D4; c += NUM_THREADS)
+            {
+                float4 xv[H];
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                    xv[h] = x4[(size_t) h * D4 + c];
+                float4 yv;
+                if constexpr (std::is_same_v<Y_T, half>)
+                {
+                    half2 y01 = ((const half2*) (ya + (size_t) r * D))[c * 2];
+                    half2 y23 = ((const half2*) (ya + (size_t) r * D))[c * 2 + 1];
+                    float2 lo = __half22float2(y01);
+                    float2 hi = __half22float2(y23);
+                    yv = make_float4(lo.x, lo.y, hi.x, hi.y);
+                }
+                else
+                    yv = ((const float4*) (ya + (size_t) r * D))[c];
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                {
+                    float4 o;
+                    o.x = post_r[h] * yv.x;
+                    o.y = post_r[h] * yv.y;
+                    o.z = post_r[h] * yv.z;
+                    o.w = post_r[h] * yv.w;
+                    #pragma unroll
+                    for (int g = 0; g < H; ++g)
+                    {
+                        o.x = fmaf(comb_r[g][h], xv[g].x, o.x);
+                        o.y = fmaf(comb_r[g][h], xv[g].y, o.y);
+                        o.z = fmaf(comb_r[g][h], xv[g].z, o.z);
+                        o.w = fmaf(comb_r[g][h], xv[g].w, o.w);
+                    }
+                    x4[(size_t) h * D4 + c] = o;
+                }
+            }
+        }
+    }
+    __threadfence_block();
+    __syncthreads();
+
+    // ---- Phase P: one mixer load per (thread, c), applied to every row of the block
+    const float* sro = (const float*) x;
+    const bool pt = threadIdx.x < NUM_THREADS_A;
+    __shared__ float red[RB][NUM_THREADS_A / 32][M + 1];
+    if (pt)
+    {
+        float acc[RB][M + 1];
+        #pragma unroll
+        for (int rr = 0; rr < RB; ++rr)
+            #pragma unroll
+            for (int k = 0; k <= M; ++k) acc[rr][k] = 0.0f;
+        for (int c = threadIdx.x; c < row_len4; c += NUM_THREADS_A)
+        {
+            float4 s[RB];
+            #pragma unroll
+            for (int rr = 0; rr < RB; ++rr)
+            {
+                s[rr] = rr < nr ? ((const float4*) (sro + (size_t) (r0 + rr) * row_len))[c] : make_float4(0.f, 0.f, 0.f, 0.f);
+                acc[rr][M] = fmaf(s[rr].x, s[rr].x, acc[rr][M]);
+                acc[rr][M] = fmaf(s[rr].y, s[rr].y, acc[rr][M]);
+                acc[rr][M] = fmaf(s[rr].z, s[rr].z, acc[rr][M]);
+                acc[rr][M] = fmaf(s[rr].w, s[rr].w, acc[rr][M]);
+            }
+            #pragma unroll
+            for (int j = 0; j < M; ++j)
+            {
+                float4 wv;
+                if constexpr (std::is_same_v<FN_T, half>)
+                {
+                    int2 pk = ((const int2*) fn)[(size_t) j * row_len4 + c];
+                    float2 lo = __half22float2(*(const half2*) &pk.x);
+                    float2 hi = __half22float2(*(const half2*) &pk.y);
+                    wv = make_float4(lo.x, lo.y, hi.x, hi.y);
+                }
+                else
+                    wv = ((const float4*) fn)[(size_t) j * row_len4 + c];
+                #pragma unroll
+                for (int rr = 0; rr < RB; ++rr)
+                {
+                    float d = fmaf(s[rr].x, wv.x, fmaf(s[rr].y, wv.y, fmaf(s[rr].z, wv.z, s[rr].w * wv.w)));
+                    acc[rr][j] += d;
+                }
+            }
+        }
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
+        #pragma unroll
+        for (int rr = 0; rr < RB; ++rr)
+            #pragma unroll
+            for (int k = 0; k <= M; ++k)
+            {
+                float v = acc[rr][k];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    v += __shfl_down_sync(0xffffffffu, v, offset);
+                if (lane == 0) red[rr][warp][k] = v;
+            }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        const int lane = threadIdx.x;
+        for (int rr = 0; rr < nr; ++rr)
+        {
+            float* out = partials + (size_t) (r0 + rr) * (M + 1);
+            for (int k = lane; k <= M; k += 32)
+            {
+                float v = 0.0f;
+                #pragma unroll
+                for (int w_ = 0; w_ < NUM_THREADS_A / 32; ++w_)
+                    v += red[rr][w_][k];
+                out[k] = v;
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    for (int rr = 0; rr < nr; ++rr)
+    {
+        hcn_finalize_body<H, M_>(sro, partials, base, scale, post, comb, y, w, wtype, D, 1,
+                                 rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, r0 + rr, ldy);
+        __syncthreads();
+    }
+}
+
+
+/*
 
 GatedResidual (Qwen4Exp, the low-rank elementwise cousin of mHC) fused mix, decode form:
 
@@ -1942,6 +2111,27 @@ void hc_pf_apply_mix_norm
         (float*) post.data_ptr(), (float*) comb.data_ptr(), (half*) y.data_ptr(), \
         wtype ? w->data_ptr() : nullptr, wtype, D, (float) rms_eps, (float) hc_eps, \
         (int) sinkhorn_iters, (float) norm_eps, (float) constant_bias, (float) constant_scale, ldy
+    static int rb = -1;
+    if (rb < 0) { const char* e = getenv("EXL3_PF_HC_RB"); rb = e ? atoi(e) : 1; }   // measured: 1-row kernel is already near its DRAM floor (RB 2/4 slower at R = 1024)
+    if (rb == 4 || rb == 2)
+    {
+        dim3 grid_rb(1, (R + rb - 1) / rb);
+        #define RB_LAUNCH(YT, FT, RBV) hc_pf_apply_mix_norm_rb_kernel<4, 24, YT, FT, RBV><<<grid_rb, NUM_THREADS + 32, 0, stream>>>(PF_ARGS(YT, FT), R)
+        const bool yh = ya.dtype() == at::kHalf, fh = fn.dtype() == at::kHalf;
+        if (rb == 4)
+        {
+            if (yh && fh) RB_LAUNCH(half, half, 4); else if (yh) RB_LAUNCH(half, float, 4);
+            else if (fh) RB_LAUNCH(float, half, 4); else RB_LAUNCH(float, float, 4);
+        }
+        else
+        {
+            if (yh && fh) RB_LAUNCH(half, half, 2); else if (yh) RB_LAUNCH(half, float, 2);
+            else if (fh) RB_LAUNCH(float, half, 2); else RB_LAUNCH(float, float, 2);
+        }
+        #undef RB_LAUNCH
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
     if (ya.dtype() == at::kHalf)
     {
         if (fn.dtype() == at::kHalf)

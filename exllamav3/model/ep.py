@@ -170,7 +170,9 @@ class EPState:
         # prefill chunk computes: enqueue, hand over, then make the compute stream wait for the result
         if not contribution:
             tensor.zero_()
-        if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min:
+        # fp16 payloads (projections that skip their fp32 widen) take the same bf16 wire: bf16 <-> fp16 is exact in
+        # range, so the consumer's in-kernel widen sees the values the fp32 path would have produced
+        if self.bf16_min and tensor.dtype in (torch.float, torch.half) and tensor.numel() >= self.bf16_min:
             t = tensor.to(torch.bfloat16)
         elif tensor.is_contiguous():
             t = tensor
@@ -192,7 +194,7 @@ class EPState:
         # communicator, and a second communicator interleaved with them can be ordered differently on each rank
         # (a cross-communicator deadlock, seen once in ~40 prefills). Decode is single-threaded: one order everywhere
         ar = self.pynccl.all_reduce if self.pynccl is not None and self.tbo is None else dist.all_reduce
-        if self.bf16_min and tensor.dtype == torch.float and tensor.numel() >= self.bf16_min:
+        if self.bf16_min and tensor.dtype in (torch.float, torch.half) and tensor.numel() >= self.bf16_min:
             t = tensor.to(torch.bfloat16)
             ar(t)
             tensor.copy_(t)

@@ -127,6 +127,9 @@ class LinearFP16:
             yh = torch.empty(y.shape, dtype = torch.half, device = y.device)
             torch.matmul(x, weight, out = yh)
             y.copy_(yh)
+            if _os.environ.get("KYOJIN_DBG_WIDEN") and not getattr(self, "_dbg_w", False):
+                self._dbg_w = True
+                print(f" [widen] {getattr(self, 'key', '?')} rows {x.shape[0]} n {y.shape[-1]}", flush = True)
         else:
             ext.hgemm(x, weight, y)
         if self.bias is not None:

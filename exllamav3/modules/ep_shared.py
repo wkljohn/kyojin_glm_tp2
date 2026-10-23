@@ -16,7 +16,7 @@ import os
 import torch
 from ..ext import exllamav3_ext as ext
 
-_SHDYN = [float(v) for v in os.environ.get("KYOJIN_EP_SHDYN", "0.15,1.13,0").split(",")]
+_SHDYN = [float(v) for v in os.environ.get("KYOJIN_EP_SHDYN", "0.07,1.0,0").split(",")]
 MAX_ROWS = 8
 
 
@@ -30,7 +30,9 @@ class EPSharedDyn:
         self.I = se.intermediate_size
         assert self.I % 128 == 0
         self.nb = self.I // 128
-        a, n = ep.split(self.I, 128)
+        # KYOJIN_EP_SHARED_PF_SHARE: rank 0's share of the channels in prefill (default KYOJIN_EP_SHARE_DENSE)
+        pf = os.environ.get("KYOJIN_EP_SHARED_PF_SHARE")
+        a, n = ep.split(self.I, 128, share = float(pf) if pf else None)
         self.static = (a, a + n)
         self.rng = {}
 

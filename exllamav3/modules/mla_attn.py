@@ -419,6 +419,7 @@ class MLAttention(Module):
             "kv_cache": True
         })
 
+        self.pf_twin = None   # KYOJIN_EP_MLA_PF_SHARE, see attach_pf_twin
         self.cache_layers = []
         self.tp_cache_lookup = {}
         self.has_split_cache = False
@@ -434,6 +435,19 @@ class MLAttention(Module):
         self.w_uv_flat = None   # (kv_lora_rank, H * v_head_dim)
         self._scratch = {}
 
+
+    def attach_pf_twin(self, twin: "MLAttention", ep):
+        """Cross-host EP: twin is this layer's MLA with the prefill head split. It keeps only its own head-sliced
+        q_b / o_proj (and loads its kv_b slice); the replicated projections, norms and indexer are this module's, and
+        the cache layer is looked up by layer index, so both modules read and write the same latent cache."""
+        shared = ("q_a_proj", "q_a_layernorm", "kv_a_proj_with_mqa", "kv_a_layernorm",
+                  "idx_wq_b", "idx_wk", "idx_k_norm", "idx_weights")
+        for name in shared:
+            setattr(twin, name, getattr(self, name))
+        twin.modules = [twin.q_b_proj, twin.o_proj]
+        twin.ep = ep
+        self.pf_twin = twin
+        self.register_submodule(twin)
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
@@ -566,6 +580,8 @@ class MLAttention(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
+        if self.pf_twin is not None and bsz * seqlen > MAX_DECODE_QLEN and not params.get("dflash_verify"):
+            return self.pf_twin.forward(x, params, out_dtype)
         attn_mode = params.get("attn_mode", "flash_attn_nc")
         match attn_mode:
             case "flash_attn":

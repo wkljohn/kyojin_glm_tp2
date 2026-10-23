@@ -227,7 +227,10 @@ class Glm5NextModel(Model):
                 if ep is not None and os.environ.get("KYOJIN_EP_MLA_SPLIT", "1") != "0":
                     # KYOJIN_EP_MLA_ALIGN (default 32): head-block alignment of the split, so both ranks fit the 32-head
                     # tiles of the fast DSA decode kernel (34/30 left rank 0 on three 16-head blocks and both off it)
-                    first, mla_heads = ep.split(config.num_q_heads, int(os.environ.get("KYOJIN_EP_MLA_ALIGN", "32")))
+                    # KYOJIN_EP_SHARE_MLA (probe): rank 0's share of the MLA heads, default KYOJIN_EP_SHARE_DENSE
+                    sm = os.environ.get("KYOJIN_EP_SHARE_MLA")
+                    first, mla_heads = ep.split(config.num_q_heads, int(os.environ.get("KYOJIN_EP_MLA_ALIGN", "32")),
+                                                share = float(sm) if sm else None)
                     mla_range = (first, config.num_q_heads)
                 attn = MLAttention(
                     config = config,
@@ -257,6 +260,28 @@ class Glm5NextModel(Model):
 
             if getattr(attn, "head_range", None):
                 attn.ep = ep
+                # KYOJIN_EP_MLA_PF_SHARE: rank 0's MLA head share for prefill only (heads % 16, e.g. 0.75 = 48/16). The
+                # latent cache holds no per-head state, so a prefill twin with its own head slice of q_b / kv_b /
+                # o_proj can split the heads differently from decode (whose fast DSA kernel wants 32/32); it
+                # shares the replicated projections, norms, indexer and the cache layer with the decode module
+                pf_share = os.environ.get("KYOJIN_EP_MLA_PF_SHARE")
+                if isinstance(attn, MLAttention) and pf_share:
+                    pf_first, pf_heads = ep.split(config.num_q_heads, int(os.environ.get("KYOJIN_EP_MLA_PF_ALIGN", "16")),
+                                                  share = float(pf_share))
+                    if (pf_first, pf_heads) != (mla_range[0], mla_heads):
+                        twin = MLAttention(
+                            config = config, key = f"{key}.self_attn", layer_idx = idx,
+                            hidden_size = config.hidden_size, num_q_heads = pf_heads,
+                            head_range = (pf_first, config.num_q_heads), kv_lora_rank = config.kv_lora_rank,
+                            qk_nope_head_dim = config.qk_nope_head_dim, qk_rope_head_dim = config.qk_rope_head_dim,
+                            v_head_dim = config.v_head_dim, rope_settings = None, q_lora_rank = config.q_lora_rank,
+                            sm_scale = config.sm_scale, rms_norm_eps = config.rms_norm_eps, qmap = "block.attn",
+                            out_dtype = torch.float, select_hq_bits = 2, indexer_mode = config.indexer_types[idx],
+                            index_n_heads = config.index_n_heads, index_head_dim = config.index_head_dim,
+                            index_topk = config.index_topk, index_kpool = config.index_kpool,
+                            index_kpool_tail = config.index_kpool_tail,
+                        )
+                        attn.attach_pf_twin(twin, ep)
                 attn.tp_reduce = True
 
             dense_mlp = None

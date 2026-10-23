@@ -149,6 +149,16 @@ def build_ids(tokenizer, family, n_tokens):
     tail = tokenizer.encode(f"\n\n{question}<|assistant|><think></think>", encode_special_tokens = True)
     b = tokenizer.encode(body, encode_special_tokens = False)
     room = n_tokens - head.shape[-1] - tail.shape[-1]
+    if b.shape[-1] < room:
+        # Long prompts (> ~8K): the other families' documents go first as earlier context, in a fixed order, so the
+        # family's own document (which the question is about) stays at the end and the prompt stays natural text
+        others = [f for f in FAMILIES if f not in (family, "needle")]
+        pre = []; got = b.shape[-1]; i = 0
+        while got < room + 16:
+            ob, _ = BODIES[others[i % len(others)]]()
+            pre.append(tokenizer.encode(ob + "\n\n---\n\n", encode_special_tokens = False)); got += pre[-1].shape[-1]; i += 1
+        p_ids = torch.cat(pre, dim = -1)
+        b = torch.cat((p_ids[:, -(room - b.shape[-1] + 16):] if family not in ("math", "chat", "zh", "json") else p_ids, b), dim = -1)
     assert b.shape[-1] >= room, f"{family}: body has {b.shape[-1]} tokens, needs {room}"
     if family == "needle":
         # the fact sits at 40 % depth of the cut document

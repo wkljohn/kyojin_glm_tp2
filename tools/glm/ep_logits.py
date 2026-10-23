@@ -67,7 +67,8 @@ def main():
         for fam in (args.families.split(",") if args.families else FAMILIES):
             ids = build_ids(tokenizer, fam, args.tokens + 1)
             x, nxt = ids[:, :-1], ids[0, -args.keep:]
-            logits = model.forward(x, {"attn_mode": "flash_attn_nc"})
+            # head only for the kept positions (full-vocabulary logits of a 16K+ prompt would not fit)
+            logits = model.forward(x, {"attn_mode": "flash_attn_nc", "last_tokens_only": args.keep})
             if rank == 0:
                 torch.save({"logits": logits[0, -args.keep:].half().cpu(), "next": nxt.cpu()},
                            os.path.join(args.out, f"{fam}.pt"))

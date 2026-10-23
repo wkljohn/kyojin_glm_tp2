@@ -1316,15 +1316,45 @@ class Generator:
             self._ep_fault_n = getattr(self, "_ep_fault_n", 0) + 1
             if self._ep_fault_n == EP_FAULT_TEST:
                 w += 1
-        t = torch.tensor([batch_size, w, s, -batch_size, -w, -s], dtype = torch.int64).to(dev)
+        vals = [batch_size, w, s, -batch_size, -w, -s]
+        if not EP_CHECK_SYNC and self._ep.pynccl is not None:
+            # Deferred (default): the reduce is queued with no host sync and its result is read at the next call,
+            # after this round's readbacks. Drafts reach every rank from rank 0's broadcast and the widths derive
+            # from that data, so a mismatch here would be a bug; it still fails closed one round later, while the
+            # round no longer stalls here waiting for the later rank's host (it absorbs the lag at the first layer)
+            self._ep_check_pending()
+            hp = self._staging("ep_check_h", 6, None, torch.int64)
+            hp.copy_(torch.tensor(vals, dtype = torch.int64))
+            t = torch.empty(6, dtype = torch.int64, device = dev)
+            t.copy_(hp, non_blocking = True)
+            self._ep.pynccl.all_reduce(t, "max")
+            res = self._staging("ep_check_r", 6, None, torch.int64)
+            res.copy_(t, non_blocking = True)
+            ev = torch.cuda.Event()
+            ev.record()
+            self._ep_check_prev = (res, (batch_size, w), ev)
+            return
+        t = torch.tensor(vals, dtype = torch.int64).to(dev)
         if self._ep.pynccl is not None:
             self._ep.pynccl.all_reduce(t, "max")
         else:
             dist.all_reduce(t, op = dist.ReduceOp.MAX)
-        mx, mn = t[:3].tolist(), [-v for v in t[3:].tolist()]
+        self._ep_check_result(t.cpu(), (batch_size, w))
+
+    def _ep_check_pending(self):
+        prev = getattr(self, "_ep_check_prev", None)
+        if prev is not None:
+            self._ep_check_prev = None
+            prev[2].synchronize()   # long done: this round's readbacks came after it
+            self._ep_check_result(prev[0], prev[1])
+
+    def _ep_check_result(self, r: torch.Tensor, local: tuple):
+        from ..model.ep import EPDesync
+        r = r.tolist()
+        mx, mn = r[:3], [-v for v in r[3:]]
         if mx != mn:
             raise EPDesync(f"rank {self._ep.rank}: batch/draft width/draft checksum differ across ranks: "
-                           f"local ({batch_size}, {w}), max {mx}, min {mn}")
+                           f"local {local}, max {mx}, min {mn}")
 
 
     def iterate_ngram_gen(self, results: list):
@@ -2193,6 +2223,8 @@ class Generator:
 SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
 EP_DRAFT_DEBUG = os.environ.get("KYOJIN_EP_DRAFT_DEBUG", "0") != "0"
 EP_FAULT_TEST = int(os.environ.get("KYOJIN_EP_FAULT_TEST", "0"))
+# KYOJIN_EP_CHECK_ROWS=sync: read the per-round row check before the forward (one host stall per round); default deferred
+EP_CHECK_SYNC = os.environ.get("KYOJIN_EP_CHECK_ROWS", "deferred") == "sync"
 SPEC_PROF_REC: list = []
 _PROF_CUR: dict = {}
 

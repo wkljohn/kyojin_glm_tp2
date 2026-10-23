@@ -83,9 +83,9 @@ class EPState:
 
     # Same signature as the TP backends' all_reduce (contribution=False: this rank adds zeros)
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True, ret_bf16: bool = False):
-        """In place over the ranks; returns the result tensor. ret_bf16 (prefill-size payloads only): when the sum
-        went over the bf16 wire, return that bf16 tensor instead of copying it back (the caller widens it exactly)"""
-        ret_bf16 = ret_bf16 and tensor.numel() >= 256 * tensor.shape[-1] and _EP_RET_BF16
+        """In place over the ranks; returns the result tensor. ret_bf16: when the sum went over the bf16 wire, return
+        that bf16 tensor instead of copying it back (the caller's consumer widens it exactly)"""
+        ret_bf16 = ret_bf16 and _EP_RET_BF16
         if self.prof is not None:
             import time
             torch.cuda.synchronize()

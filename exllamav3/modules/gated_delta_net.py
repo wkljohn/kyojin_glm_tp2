@@ -1831,12 +1831,13 @@ class GatedDeltaNet(Module):
             os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1"
         if self.tp_reduce:
             if self.ep is not None:
-                x = self.ep.all_reduce(x, ret_bf16 = f16_keep and params.get("pfe_y_bf16_ok", False))
+                x = self.ep.all_reduce(x, ret_bf16 = out_dtype is None and params.get("pfe_y_bf16_ok", False))
             else:
                 params["backend"].all_reduce(x)
 
-        # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
-        if f16_keep:
+        # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention);
+        # an EP bf16 wire sum handed back for the block's exact-widening consumer is kept as is
+        if f16_keep or x.dtype == torch.bfloat16:
             return x
         return to2(x, out_dtype, self.out_dtype)
 

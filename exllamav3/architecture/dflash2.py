@@ -277,7 +277,17 @@ class DFlash2Model(DFlashModel):
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Anchor token of each row (the last accepted token), the selector's first predecessor
-        params["dflash2_anchor"] = input_ids[:, -1].clone()
+        # Staged through a pinned buffer: a pageable H2D in sample_from_state would block the host until the GPU queue
+        # drains (one full stall per draft round)
+        a = input_ids[:, -1]
+        pin = getattr(self, "_anchor_pin", None)
+        if a.device.type == "cpu" and torch.cuda.is_available():
+            if pin is None or pin.shape[0] < a.shape[0] or pin.dtype != a.dtype:
+                pin = self._anchor_pin = torch.empty((max(32, a.shape[0]),), dtype = a.dtype, pin_memory = True)
+            pin[:a.shape[0]].copy_(a)
+            params["dflash2_anchor"] = pin[:a.shape[0]]
+        else:
+            params["dflash2_anchor"] = a.clone()
         return super().prepare_inputs(input_ids, params)
 
     @override
@@ -293,7 +303,7 @@ class DFlash2Model(DFlashModel):
         if cfg.final_logit_softcapping:
             logits = torch.tanh(logits / cfg.final_logit_softcapping) * cfg.final_logit_softcapping
         unary, cand = logits.topk(cfg.selector_top_k, dim = -1)
-        anchor = params["dflash2_anchor"].to(state.device)
+        anchor = params["dflash2_anchor"].to(state.device, non_blocking = True)
         path, conf = self.selector.select(cand, unary, hidden.half(), anchor)
         if params.get("export_draft_cand"):
             params["draft_cand"] = (cand, self.selector.last_unary, self.selector.last_pair)

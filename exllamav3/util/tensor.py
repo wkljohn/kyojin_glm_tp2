@@ -10,8 +10,17 @@ def host_cuts() -> bool:
     single kernel's math -- one fused cast instead of cast+contiguous, memoized workspace
     slices, dtype no-op early-outs, cached decode staging buffers. Read per call so one loaded
     process can A/B arms at run time. Every path here is value-identical to the code it
-    replaces (same kernels, same arguments, same rounding)."""
-    return os.environ.get("EXL3_HOST_CUTS", "0") == "1" and os.environ.get("EXL3_HOST_LEAN", "0") == "1"
+    replaces (same kernels, same arguments, same rounding). Read once (it sits on every decode layer's host path;
+    EXL3_HOST_CUTS_DYNAMIC=1 restores the per-call read for in-process A/B)."""
+    global _HOST_CUTS
+    if _HOST_CUTS is not None:
+        return _HOST_CUTS
+    v = os.environ.get("EXL3_HOST_CUTS", "0") == "1" and os.environ.get("EXL3_HOST_LEAN", "0") == "1"
+    if os.environ.get("EXL3_HOST_CUTS_DYNAMIC", "0") != "1":
+        _HOST_CUTS = v
+    return v
+
+_HOST_CUTS = None   # cached on the first call (after the server / bench applied its environment)
 
 class SeqTensor:
 

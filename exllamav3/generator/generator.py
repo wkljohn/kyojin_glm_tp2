@@ -1159,9 +1159,12 @@ class Generator:
         window = self.num_draft_tokens
 
         # Create block index table for batch
+        # Pinned staging (own keys: the verify forward fills its buffers in the same round before any sync), so the
+        # drafter's attention uploads them asynchronously instead of stalling the host on a pageable H2D
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        block_index = self._staging("d_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("d_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
